@@ -19,10 +19,10 @@ pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-`stock-scoring-system` CI 会在构建前 `git clone` 本仓库；本地打镜像也可：
+生产镜像 **`quant-model-trainer`** 由本仓库 CI 构建（`Dockerfile` → ghcr → ACR relay）。
 
 ```bash
-cd stock-scoring-system && ./scripts/copy-quant-model-platform.sh
+docker build -t quant-model-trainer:local .
 ```
 
 ## 运行 worker（需 Mongo `quant_ml` 与可选 Parquet 路径）
