@@ -6,15 +6,20 @@
 
 - 研究协议：[`docs/RESEARCH_PROTOCOL.md`](docs/RESEARCH_PROTOCOL.md)
 
+## 仓库
+
+- GitHub（private）：https://github.com/blueenergy/quant-model-platform
+
 ## 本地开发
 
 ```bash
+git clone git@github.com:blueenergy/quant-model-platform.git
 cd quant-model-platform
 pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-在 `stock-scoring-system` 镜像中构建前，从 monorepo 同步源码：
+`stock-scoring-system` CI 会在构建前 `git clone` 本仓库；本地打镜像也可：
 
 ```bash
 cd stock-scoring-system && ./scripts/copy-quant-model-platform.sh
