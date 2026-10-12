@@ -111,6 +111,9 @@ jobs:
           GH_TOKEN: ${{ secrets.INFRA_REPO_TOKEN }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
+          # Secrets pasted into GitHub often keep a trailing newline. actions/checkout
+          # trims it, but gh rejects the resulting Authorization header.
+          GH_TOKEN="$(printf '%s' "$GH_TOKEN" | tr -d '[:space:]')"
           gh api --method POST \
             repos/blueenergy/quant-infrastructure/dispatches \
             -f event_type=deploy \
