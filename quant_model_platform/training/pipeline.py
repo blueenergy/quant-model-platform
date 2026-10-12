@@ -12,6 +12,7 @@ import pandas as pd
 
 from quant_model_platform.config import PlatformConfig
 from quant_model_platform.dataset.builder import build_synthetic_dataset, load_dataset_parquet
+from quant_model_platform.dataset.production import build_production_panel
 from quant_model_platform.storage.s3 import ensure_local_parquet, publish_local_parquet
 from quant_model_platform.dataset.features import registry_names
 from quant_model_platform.evaluation.gates import evaluate_fold, passes_promotion_gates
@@ -45,6 +46,26 @@ def run_training_job(
         panel = load_dataset_parquet(local_path)
         snapshot_id = params.get("snapshot_id", "external")
         parquet_path = str(parquet_path)
+    elif str(params.get("data_source") or "") == "production_scores":
+        start_date = str(params.get("start_date") or "")
+        end_date = str(params.get("end_date") or "")
+        if not start_date or not end_date:
+            raise ValueError("production_scores requires start_date and end_date (YYYYMMDD)")
+        panel, manifest = build_production_panel(
+            index_code=index_code,
+            start_date=start_date,
+            end_date=end_date,
+            parquet_dir=parquet_root / "snapshots",
+            config=cfg,
+        )
+        snapshot_id = manifest.snapshot_id
+        local_path = parquet_root / "snapshots" / f"{index_code}_production_{start_date}_{end_date}.parquet"
+        parquet_path = publish_local_parquet(
+            local_path,
+            index_code=index_code,
+            snapshot_id=snapshot_id,
+            config=cfg,
+        )
     else:
         panel, manifest = build_synthetic_dataset(index_code=index_code, parquet_dir=parquet_root / "snapshots")
         snapshot_id = manifest.snapshot_id

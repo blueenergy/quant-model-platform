@@ -10,6 +10,8 @@ from dataclasses import dataclass
 class PlatformConfig:
     mongo_uri: str
     quant_ml_db: str
+    mongo_db: str
+    data_db_name: str
     parquet_root: str
     s3_bucket: str
     s3_prefix: str
@@ -19,8 +21,10 @@ class PlatformConfig:
     @classmethod
     def from_env(cls) -> "PlatformConfig":
         return cls(
-            mongo_uri=os.environ.get("MONGO_URI", "mongodb://localhost:27017"),
+            mongo_uri=os.environ.get("MONGO_URI", os.environ.get("MONGO_URL", "mongodb://localhost:27017")),
             quant_ml_db=os.environ.get("QUANT_ML_DB", "quant_ml"),
+            mongo_db=os.environ.get("MONGO_DB", "finance"),
+            data_db_name=os.environ.get("DATA_DB_NAME", "quant_data"),
             parquet_root=os.environ.get("QUANT_ML_PARQUET_ROOT", "/data/quant_ml/parquet"),
             s3_bucket=os.environ.get("QUANT_ML_S3_BUCKET", ""),
             s3_prefix=os.environ.get("QUANT_ML_S3_PREFIX", "quant_ml"),
