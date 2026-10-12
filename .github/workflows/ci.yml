@@ -111,9 +111,11 @@ jobs:
           INFRA_REPO_TOKEN: ${{ secrets.INFRA_REPO_TOKEN }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          curl -fsSL -X POST \
+          curl --fail-with-body --show-error --silent -X POST \
             -H "Authorization: Bearer ${INFRA_REPO_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
             https://api.github.com/repos/blueenergy/quant-infrastructure/dispatches \
             -d "{\"event_type\":\"deploy\",\"client_payload\":{\"services\":\"quant-model-trainer\",\"tag\":\"${TAG}\"}}"
 
