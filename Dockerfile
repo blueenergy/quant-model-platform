@@ -19,8 +19,10 @@ RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && 
     pip config set global.extra-index-url https://pypi.org/simple && \
     pip install --no-cache-dir .
 
-RUN useradd -u 1000 -g 1000 -m -d /tmp appuser && chown -R appuser:appuser /app
-USER 1000
+RUN groupadd -g 1000 appgroup && \
+    useradd -u 1000 -g appgroup -m appuser && \
+    chown -R appuser:appgroup /app
+USER appuser
 
 ENTRYPOINT ["python", "-m", "quant_model_platform.workers.run_loop"]
 CMD ["--limit-per-iteration", "1"]
