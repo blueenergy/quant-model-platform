@@ -31,7 +31,12 @@ def run_shadow_batch(params: Dict[str, Any], config: PlatformConfig) -> Dict[str
     index_code = str(params.get("index_code", "csi1000"))
     model_id = str(params.get("model_id") or f"shadow-{index_code}")
     model_kind = str(params.get("model_kind", "ridge"))
-    panel, manifest = build_synthetic_dataset(index_code=index_code, parquet_dir=Path(config.parquet_root) / "shadow")
+    parquet_dir = Path(config.parquet_root) / "shadow"
+    panel, manifest = build_synthetic_dataset(index_code=index_code, parquet_dir=parquet_dir)
+    from quant_model_platform.storage.s3 import publish_local_parquet
+
+    local_snap = parquet_dir / f"{index_code}_synthetic.parquet"
+    publish_local_parquet(local_snap, index_code=index_code, snapshot_id=manifest.snapshot_id, config=config)
     label_col = "label_fwd_20d"
     features = registry_names()
     train = panel.dropna(subset=[label_col])

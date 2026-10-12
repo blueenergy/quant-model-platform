@@ -25,6 +25,12 @@ python -m pytest -q
 docker build -t quant-model-trainer:local .
 ```
 
+## Parquet 与 S3（K8s）
+
+`MODEL_TRAINING_RUNTIME=external_k8s` 时，训练结束会将快照上传到  
+`s3://<bucket>/<QUANT_ML_S3_PREFIX>/snapshots/<index_code>/<snapshot_id>.parquet`  
+（S3 凭证可与 `PORTFOLIO_RESEARCH_S3_*` 共用）。后续 job 在 `params.parquet_path` 填该 `s3://` URI 时，worker 会下载到 `QUANT_ML_PARQUET_ROOT/cache/` 并复用本地缓存。
+
 ## 运行 worker（需 Mongo `quant_ml` 与可选 Parquet 路径）
 
 ```bash

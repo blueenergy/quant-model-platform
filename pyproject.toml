@@ -17,6 +17,7 @@ dependencies = [
     "lightgbm>=4.0",
     "pydantic>=2.0",
     "scipy>=1.10",
+    "boto3>=1.28",
 ]
 
 [project.optional-dependencies]

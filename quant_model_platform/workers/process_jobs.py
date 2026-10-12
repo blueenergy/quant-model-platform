@@ -28,7 +28,11 @@ def process_model_training_job(
     try:
         queue.heartbeat(job_id, "training", "running pipeline")
         cfg = config or PlatformConfig.from_env()
-        result = run_training_job(dict(job.get("params") or {}), parquet_root=Path(cfg.parquet_root))
+        result = run_training_job(
+            dict(job.get("params") or {}),
+            parquet_root=Path(cfg.parquet_root),
+            config=cfg,
+        )
         collections = get_ml_collections(config=cfg)
         result_doc = {
             **result,
