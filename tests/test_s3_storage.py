@@ -4,8 +4,11 @@ import pytest
 
 from quant_model_platform.config import PlatformConfig
 from quant_model_platform.storage.s3 import (
+    canonical_snapshot_id,
+    canonical_snapshot_object_key,
     is_s3_uri,
     s3_env_complete,
+    s3_uri_for_canonical_snapshot,
     s3_uri_for_snapshot,
     should_use_s3_parquet,
     snapshot_object_key,
@@ -15,6 +18,16 @@ from quant_model_platform.storage.s3 import (
 def test_snapshot_object_key():
     key = snapshot_object_key("csi1000", "abc-123", prefix="quant_ml")
     assert key == "quant_ml/snapshots/csi1000/abc-123.parquet"
+
+
+def test_canonical_snapshot_key_and_id():
+    assert canonical_snapshot_id("hs300") == "hs300-current"
+    key = canonical_snapshot_object_key("hs300", prefix="quant_ml")
+    assert key == "quant_ml/snapshots/hs300/current.parquet"
+    os.environ["QUANT_ML_S3_BUCKET"] = "aipoc"
+    cfg = PlatformConfig.from_env()
+    uri = s3_uri_for_canonical_snapshot("hs300", config=cfg)
+    assert uri == "s3://aipoc/quant_ml/snapshots/hs300/current.parquet"
 
 
 def test_s3_uri_for_snapshot():

@@ -46,6 +46,7 @@ def ensure_ml_indexes(collections: Dict[str, Any]) -> None:
     results.create_index([("job_id", ASCENDING)])
     datasets = collections[COLLECTION_DATASETS]
     datasets.create_index([("snapshot_id", ASCENDING)], unique=True)
+    datasets.create_index([("index_code", ASCENDING), ("channel", ASCENDING)], unique=True, sparse=True)
     datasets.create_index([("content_hash", ASCENDING)])
     preds = collections[COLLECTION_PREDICTIONS]
     preds.create_index([("model_id", ASCENDING), ("trade_date", ASCENDING), ("ts_code", ASCENDING)])

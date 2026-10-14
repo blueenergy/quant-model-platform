@@ -61,6 +61,23 @@ def _flatten_score_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
     return row
 
 
+def latest_score_date_for_index(
+    client: MongoClient,
+    *,
+    mongo_db: str,
+    index_code: str,
+) -> Optional[str]:
+    coll = client[mongo_db]["stock_scores"]
+    doc = coll.find_one(
+        {"index_codes": index_code},
+        {"_id": 0, "score_date": 1},
+        sort=[("score_date", -1)],
+    )
+    if not doc:
+        return None
+    return _normalize_trade_date(doc.get("score_date"))
+
+
 def load_stock_score_rows(
     client: MongoClient,
     *,
@@ -135,6 +152,7 @@ def build_production_panel(
     parquet_dir: Path,
     config: Optional[PlatformConfig] = None,
     client: Optional[MongoClient] = None,
+    use_canonical_snapshot: bool = False,
 ) -> Tuple[pd.DataFrame, Any]:
     """Build PIT score panel + forward labels; write parquet under parquet_dir."""
     cfg = config or PlatformConfig.from_env()
@@ -171,7 +189,10 @@ def build_production_panel(
             raise RuntimeError(f"no volume_price rows in {cfg.data_db_name} for panel symbols")
         panel = attach_label_column(panel, prices)
         parquet_dir.mkdir(parents=True, exist_ok=True)
-        path = parquet_dir / f"{index_code}_production_{start_date}_{end_date}.parquet"
+        if use_canonical_snapshot:
+            path = parquet_dir / f"{index_code}_current.parquet"
+        else:
+            path = parquet_dir / f"{index_code}_production_{start_date}_{end_date}.parquet"
         write_parquet_snapshot(panel, path)
         source_revision = f"stock_scores:{cfg.mongo_db}:{index_code}:{start_date}-{end_date}"
         manifest = build_manifest(
@@ -182,6 +203,7 @@ def build_production_panel(
             parquet_path=path,
             source_revision=source_revision,
             pit_policy="stock_scores.index_codes",
+            use_canonical_snapshot=use_canonical_snapshot,
         )
         log.info(
             "production panel rows=%d dates=%d symbols=%d path=%s",
@@ -196,4 +218,9 @@ def build_production_panel(
             mongo.close()
 
 
-__all__ = ["build_production_panel", "load_open_prices", "load_stock_score_rows"]
+__all__ = [
+    "build_production_panel",
+    "latest_score_date_for_index",
+    "load_open_prices",
+    "load_stock_score_rows",
+]

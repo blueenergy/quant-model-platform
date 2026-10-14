@@ -6,7 +6,9 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 
+from quant_model_platform.config import PlatformConfig
 from quant_model_platform.db import COLLECTION_JOBS, COLLECTION_RESULTS, COLLECTION_SHADOW_PROFILES
+from quant_model_platform.shadow.dataset import apply_canonical_parquet_resolution
 
 
 def _short_job_id(job_id: str) -> str:
@@ -44,7 +46,8 @@ def merge_job_into_shadow_params(params: Dict[str, Any], collections: Dict[str, 
     index_code = str(p.get("index_code", "unknown"))
     p.setdefault("model_id", f"promo-{index_code}-{_short_job_id(str(job_id))}")
     p["source_job_id"] = str(job_id)
-    return p
+    cfg = PlatformConfig.from_env()
+    return apply_canonical_parquet_resolution(p, collections, mongo_db=cfg.mongo_db)
 
 
 def load_shadow_profiles_from_env() -> List[Dict[str, Any]]:

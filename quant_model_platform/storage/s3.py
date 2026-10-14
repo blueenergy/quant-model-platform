@@ -65,9 +65,25 @@ def _s3_client():
     )
 
 
+def canonical_snapshot_id(index_code: str) -> str:
+    return f"{index_code}-current"
+
+
 def snapshot_object_key(index_code: str, snapshot_id: str, *, prefix: str) -> str:
     base = prefix.strip("/") or "quant_ml"
     return f"{base}/snapshots/{index_code}/{snapshot_id}.parquet"
+
+
+def canonical_snapshot_object_key(index_code: str, *, prefix: str) -> str:
+    base = prefix.strip("/") or "quant_ml"
+    return f"{base}/snapshots/{index_code}/current.parquet"
+
+
+def s3_uri_for_canonical_snapshot(index_code: str, config: Optional[PlatformConfig] = None) -> str:
+    cfg = config or PlatformConfig.from_env()
+    bucket = _setting("BUCKET")
+    key = canonical_snapshot_object_key(index_code, prefix=cfg.s3_prefix)
+    return f"s3://{bucket}/{key}"
 
 
 def s3_uri_for_snapshot(index_code: str, snapshot_id: str, config: Optional[PlatformConfig] = None) -> str:
@@ -120,6 +136,25 @@ def publish_local_parquet(
     if not should_use_s3_parquet(config):
         return str(local_path)
     uri = s3_uri_for_snapshot(index_code, snapshot_id, config=config)
+    upload_file(local_path, uri)
+    return uri
+
+
+def publish_canonical_local_parquet(
+    local_path: Path,
+    *,
+    index_code: str,
+    config: Optional[PlatformConfig] = None,
+) -> str:
+    """Overwrite the per-index current.parquet object when S3 is enabled."""
+    if not should_use_s3_parquet(config):
+        canonical_local = local_path.parent / f"{index_code}_current.parquet"
+        if canonical_local.resolve() != local_path.resolve():
+            import shutil
+
+            shutil.copy2(local_path, canonical_local)
+        return str(canonical_local)
+    uri = s3_uri_for_canonical_snapshot(index_code, config=config)
     upload_file(local_path, uri)
     return uri
 

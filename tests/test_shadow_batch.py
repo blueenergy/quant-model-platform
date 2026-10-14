@@ -37,7 +37,8 @@ class _MemColl:
         return sum(1 for d in self.docs if all(d.get(k) == v for k, v in query.items()))
 
 
-def test_shadow_batch_from_training_parquet(tmp_path: Path):
+def test_shadow_batch_from_training_parquet(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MODEL_SHADOW_PARQUET_RESOLUTION", "job")
     result = run_training_job(
         {
             "index_code": "csi1000",

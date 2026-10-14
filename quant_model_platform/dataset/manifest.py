@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import pandas as pd
 
 from quant_model_platform.dataset.features import registry_document
+from quant_model_platform.storage.s3 import canonical_snapshot_id
 
 
 def _canonical_json(payload: Dict[str, Any]) -> str:
@@ -72,14 +73,19 @@ def build_manifest(
     source_revision: str = "synthetic",
     pit_policy: str = "v0.1",
     feature_registry: Optional[Sequence[Dict[str, object]]] = None,
+    snapshot_id: Optional[str] = None,
+    use_canonical_snapshot: bool = False,
 ) -> DatasetManifest:
     reg = list(feature_registry or registry_document())
     extra = {"index_code": index_code, "start_date": start_date, "end_date": end_date, "registry": reg}
     h = content_hash(frame, extra=extra)
-    snapshot_id = str(uuid.uuid4())
+    if use_canonical_snapshot:
+        sid = canonical_snapshot_id(index_code)
+    else:
+        sid = str(snapshot_id or uuid.uuid4())
     uri = parquet_path.as_uri() if parquet_path.is_absolute() else str(parquet_path)
     return DatasetManifest(
-        snapshot_id=snapshot_id,
+        snapshot_id=sid,
         content_hash=h,
         index_code=index_code,
         start_date=start_date,
