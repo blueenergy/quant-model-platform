@@ -42,7 +42,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     cfg = PlatformConfig.from_env()
-    end_date = _resolve_end_date(args.end_date, index_code=args.index_code, config=cfg)
+    end_date = _resolve_end_date(args.end_date, index_code=args.index_code, cfg=cfg)
     parquet_dir = Path(cfg.parquet_root) / "snapshots"
     _panel, manifest = build_production_panel(
         index_code=args.index_code,
@@ -83,6 +83,8 @@ def main(argv=None) -> int:
         )
         if args.canonical:
             doc["channel"] = PRODUCTION_CURRENT_CHANNEL
+            # Mongo rejects the same path in $set and $setOnInsert.
+            doc.pop("created_at", None)
             collections[COLLECTION_DATASETS].update_one(
                 {"snapshot_id": canonical_snapshot_id(args.index_code)},
                 {"$set": doc, "$setOnInsert": {"created_at": datetime.utcnow()}},

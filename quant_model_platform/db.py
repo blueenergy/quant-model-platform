@@ -16,6 +16,8 @@ COLLECTION_SHADOW_JOBS = "model_shadow_jobs"
 COLLECTION_SHADOW_PROFILES = "model_shadow_profiles"
 COLLECTION_WORKER_STATUS = "model_training_worker_status"
 
+_CHANNEL_INDEX = "index_code_1_channel_1"
+
 
 def get_ml_client(config: PlatformConfig | None = None) -> MongoClient:
     cfg = config or PlatformConfig.from_env()
@@ -46,7 +48,16 @@ def ensure_ml_indexes(collections: Dict[str, Any]) -> None:
     results.create_index([("job_id", ASCENDING)])
     datasets = collections[COLLECTION_DATASETS]
     datasets.create_index([("snapshot_id", ASCENDING)], unique=True)
-    datasets.create_index([("index_code", ASCENDING), ("channel", ASCENDING)], unique=True, sparse=True)
+    # Only channel-tagged manifests are unique per index; uuid training snapshots repeat.
+    legacy = datasets.index_information().get(_CHANNEL_INDEX)
+    if legacy is not None and "partialFilterExpression" not in legacy:
+        datasets.drop_index(_CHANNEL_INDEX)
+    datasets.create_index(
+        [("index_code", ASCENDING), ("channel", ASCENDING)],
+        name=_CHANNEL_INDEX,
+        unique=True,
+        partialFilterExpression={"channel": {"$exists": True}},
+    )
     datasets.create_index([("content_hash", ASCENDING)])
     preds = collections[COLLECTION_PREDICTIONS]
     preds.create_index([("model_id", ASCENDING), ("trade_date", ASCENDING), ("ts_code", ASCENDING)])
