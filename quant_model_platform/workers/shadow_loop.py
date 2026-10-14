@@ -5,64 +5,32 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import uuid
-from datetime import datetime
-from typing import Any, Dict, List
-
-import pandas as pd
 
 from quant_model_platform.config import PlatformConfig
-from quant_model_platform.db import COLLECTION_PREDICTIONS, COLLECTION_SHADOW_JOBS, ensure_ml_indexes, get_ml_collections
-from quant_model_platform.dataset.builder import build_synthetic_dataset
-from quant_model_platform.dataset.features import registry_names
+from quant_model_platform.db import COLLECTION_SHADOW_JOBS, ensure_ml_indexes, get_ml_collections
 from quant_model_platform.queue import JobQueue, WorkerLockHeld, install_shutdown_handlers, run_worker_forever, worker_lock
-from quant_model_platform.training.models import predict_model, train_model
+from quant_model_platform.shadow.batch import run_shadow_batch
+from quant_model_platform.shadow.resolve import load_enabled_shadow_profiles, resolve_profile_params
 
 log = logging.getLogger("model_shadow_loop")
 
 
-def _latest_trade_date(panel: pd.DataFrame) -> str:
-    return str(sorted(panel["trade_date"].unique())[-1])
-
-
-def run_shadow_batch(params: Dict[str, Any], config: PlatformConfig) -> Dict[str, Any]:
-    from pathlib import Path
-
-    index_code = str(params.get("index_code", "csi1000"))
-    model_id = str(params.get("model_id") or f"shadow-{index_code}")
-    model_kind = str(params.get("model_kind", "ridge"))
-    parquet_dir = Path(config.parquet_root) / "shadow"
-    panel, manifest = build_synthetic_dataset(index_code=index_code, parquet_dir=parquet_dir)
-    from quant_model_platform.storage.s3 import publish_local_parquet
-
-    local_snap = parquet_dir / f"{index_code}_synthetic.parquet"
-    publish_local_parquet(local_snap, index_code=index_code, snapshot_id=manifest.snapshot_id, config=config)
-    label_col = "label_fwd_20d"
-    features = registry_names()
-    train = panel.dropna(subset=[label_col])
-    model = train_model(model_kind, train, features, label_col)
-    as_of = _latest_trade_date(panel)
-    day = panel.loc[panel["trade_date"] == as_of].copy()
-    day["score"] = predict_model(day, model)
-    records: List[Dict[str, Any]] = []
-    now = datetime.utcnow()
-    for _, row in day.iterrows():
-        records.append(
-            {
-                "prediction_id": str(uuid.uuid4()),
-                "model_id": model_id,
-                "snapshot_id": manifest.snapshot_id,
-                "trade_date": as_of,
-                "ts_code": row["ts_code"],
-                "score": float(row["score"]),
-                "created_at": now,
-                "shadow": True,
-            }
-        )
+def run_all_configured_shadow_batches(config: PlatformConfig) -> list:
     collections = get_ml_collections(config=config)
-    if records:
-        collections[COLLECTION_PREDICTIONS].insert_many(records)
-    return {"model_id": model_id, "trade_date": as_of, "n_predictions": len(records)}
+    profiles = load_enabled_shadow_profiles(collections)
+    if not profiles:
+        raise RuntimeError(
+            "no shadow profiles configured; set MODEL_SHADOW_PROFILES JSON or model_shadow_profiles in Mongo"
+        )
+    summaries = []
+    for profile in profiles:
+        params = resolve_profile_params(profile, collections)
+        name = profile.get("profile_id") or params.get("model_id") or params.get("source_job_id")
+        log.info("shadow profile start: %s", name)
+        summary = run_shadow_batch(params, config, collections=collections)
+        summaries.append(summary)
+        log.info("shadow profile done: %s -> %s", name, summary)
+    return summaries
 
 
 def main(argv=None) -> int:
@@ -71,7 +39,12 @@ def main(argv=None) -> int:
     parser.add_argument("--worker-id", default=os.getenv("MODEL_SHADOW_WORKER_ID", "shadow-1"))
     parser.add_argument("--interval-seconds", type=float, default=float(os.getenv("MODEL_SHADOW_LOOP_INTERVAL_SECONDS", "300")))
     parser.add_argument("--lock-file", default=os.getenv("MODEL_SHADOW_LOCK_FILE", "/tmp/model_shadow_worker.lock"))
-    parser.add_argument("--once", action="store_true", help="Run one shadow batch and exit")
+    parser.add_argument("--once", action="store_true", help="Run configured shadow profiles once and exit")
+    parser.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="Dev only: run one synthetic csi1000 batch (ignores MODEL_SHADOW_PROFILES)",
+    )
     args = parser.parse_args(argv)
     install_shutdown_handlers()
     cfg = PlatformConfig.from_env()
@@ -82,20 +55,24 @@ def main(argv=None) -> int:
     def step() -> None:
         job = queue.claim(args.worker_id)
         if not job:
-            # No queued shadow job: run default daily batch idempotently via synthetic params.
-            run_shadow_batch({"index_code": "csi1000", "model_kind": "ridge"}, cfg)
+            run_all_configured_shadow_batches(cfg)
             return
         try:
             queue.heartbeat(job["job_id"], "shadow", "predict")
-            summary = run_shadow_batch(dict(job.get("params") or {}), cfg)
+            summary = run_shadow_batch(dict(job.get("params") or {}), cfg, collections=collections)
             queue.complete(job["job_id"], **summary)
         except Exception as exc:
             queue.fail(job["job_id"], exc)
             raise
 
+    if args.synthetic:
+        summary = run_shadow_batch({"index_code": "csi1000", "model_kind": "ridge", "mode": "synthetic"}, cfg)
+        log.info("shadow synthetic once: %s", summary)
+        return 0
+
     if args.once:
-        summary = run_shadow_batch({"index_code": "csi1000", "model_kind": "ridge"}, cfg)
-        log.info("shadow once complete: %s", summary)
+        summaries = run_all_configured_shadow_batches(cfg)
+        log.info("shadow once complete: %s", summaries)
         return 0
 
     try:

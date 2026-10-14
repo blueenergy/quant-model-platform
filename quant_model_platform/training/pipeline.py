@@ -11,10 +11,10 @@ from typing import Any, Dict, List, Optional, Sequence
 import pandas as pd
 
 from quant_model_platform.config import PlatformConfig
-from quant_model_platform.dataset.builder import build_synthetic_dataset, load_dataset_parquet
-from quant_model_platform.dataset.production import build_production_panel
-from quant_model_platform.storage.s3 import ensure_local_parquet, publish_local_parquet
 from quant_model_platform.dataset.features import registry_names
+from quant_model_platform.training.artifacts import artifact_uri_for_result, save_trained_model
+from quant_model_platform.training.fit import fit_full_sample_model
+from quant_model_platform.training.panel_loader import load_training_panel
 from quant_model_platform.evaluation.gates import evaluate_fold, passes_promotion_gates
 from quant_model_platform.evaluation.metrics import permutation_test_ic, spearman_ic, summarize_ic
 from quant_model_platform.evaluation.walk_forward import purged_walk_forward_folds, split_frame_by_dates
@@ -35,47 +35,21 @@ def run_training_job(
 ) -> Dict[str, Any]:
     """Execute one training job document (synthetic or parquet snapshot)."""
     cfg = config or PlatformConfig.from_env()
-    cache_root = parquet_root / "cache"
-    index_code = str(params.get("index_code", "csi1000"))
+    if config is None:
+        cfg = PlatformConfig(
+            mongo_uri=cfg.mongo_uri,
+            quant_ml_db=cfg.quant_ml_db,
+            mongo_db=cfg.mongo_db,
+            data_db_name=cfg.data_db_name,
+            parquet_root=str(parquet_root),
+            s3_bucket=cfg.s3_bucket,
+            s3_prefix=cfg.s3_prefix,
+            runtime=cfg.runtime,
+            worker_pool=cfg.worker_pool,
+        )
     model_kind = str(params.get("model_kind", "ridge"))
     label_col = str(params.get("label_col", "label_fwd_20d"))
-    parquet_path = params.get("parquet_path")
-
-    if parquet_path:
-        local_path = ensure_local_parquet(str(parquet_path), cache_root=cache_root)
-        panel = load_dataset_parquet(local_path)
-        snapshot_id = params.get("snapshot_id", "external")
-        parquet_path = str(parquet_path)
-    elif str(params.get("data_source") or "") == "production_scores":
-        start_date = str(params.get("start_date") or "")
-        end_date = str(params.get("end_date") or "")
-        if not start_date or not end_date:
-            raise ValueError("production_scores requires start_date and end_date (YYYYMMDD)")
-        panel, manifest = build_production_panel(
-            index_code=index_code,
-            start_date=start_date,
-            end_date=end_date,
-            parquet_dir=parquet_root / "snapshots",
-            config=cfg,
-        )
-        snapshot_id = manifest.snapshot_id
-        local_path = parquet_root / "snapshots" / f"{index_code}_production_{start_date}_{end_date}.parquet"
-        parquet_path = publish_local_parquet(
-            local_path,
-            index_code=index_code,
-            snapshot_id=snapshot_id,
-            config=cfg,
-        )
-    else:
-        panel, manifest = build_synthetic_dataset(index_code=index_code, parquet_dir=parquet_root / "snapshots")
-        snapshot_id = manifest.snapshot_id
-        local_path = parquet_root / "snapshots" / f"{index_code}_synthetic.parquet"
-        parquet_path = publish_local_parquet(
-            local_path,
-            index_code=index_code,
-            snapshot_id=snapshot_id,
-            config=cfg,
-        )
+    panel, snapshot_id, parquet_path = load_training_panel(params, parquet_root=parquet_root, config=cfg)
 
     feature_names = list(params.get("feature_names") or registry_names())
     dates = sorted(panel["trade_date"].unique().tolist())
@@ -108,7 +82,7 @@ def run_training_job(
 
     # Full-sample baseline vs model for promotion summary
     full_baseline = train_model("rule_baseline", panel.dropna(subset=[label_col]), feature_names, label_col)
-    full_model = train_model(model_kind, panel.dropna(subset=[label_col]), feature_names, label_col, params=params.get("model_params"))
+    full_model = fit_full_sample_model(panel, params, label_col=label_col, feature_names=feature_names)
     scored = panel.dropna(subset=[label_col]).copy()
     scored["pred"] = predict_model(scored, full_model)
     scored["baseline_pred"] = predict_model(scored, full_baseline)
@@ -122,6 +96,7 @@ def run_training_job(
     )
 
     result_id = str(uuid.uuid4())
+    artifact_uri = save_trained_model(full_model, artifact_uri_for_result(result_id, config=cfg))
     artifact_hash = _artifact_hash(
         {
             "model_kind": model_kind,
@@ -141,6 +116,7 @@ def run_training_job(
             "permutation_p": perm_p,
             "baseline_ic": baseline_ic,
             "artifact_hash": artifact_hash,
+            "artifact_uri": artifact_uri,
             "code_version": params.get("code_version", "0.1.0"),
         }
     )

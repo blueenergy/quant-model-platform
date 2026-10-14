@@ -19,3 +19,4 @@ def test_training_pipeline_smoke(tmp_path: Path):
     assert result["result_id"]
     assert "promotion" in result
     assert "artifact_hash" in result
+    assert "artifact_uri" in result
