@@ -1,9 +1,26 @@
 import pandas as pd
+import pytest
 
 from quant_model_platform.demo.backfill_pit import pit_train_dates, predict_cross_section_as_of, truncate_panel
 from quant_model_platform.demo.ranking import top_n_symbols
 from quant_model_platform.demo.track_a import baseline_score_rows, growth_cycle_composite
 from quant_model_platform.demo.track_b import resolve_model_scores
+
+
+def _pit_panel(days, symbols=("AAA", "BBB")):
+    """Two names over ``days``, labelled everywhere but the final day."""
+    rows = []
+    for day in days:
+        for code, level in zip(symbols, (1.0, -1.0)):
+            rows.append(
+                {
+                    "trade_date": day,
+                    "ts_code": code,
+                    "growth_score": level,
+                    "label_fwd_20d": 0.01 * level if day < days[-1] else None,
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def test_growth_cycle_blend_60_40():
@@ -16,11 +33,17 @@ def test_baseline_uses_stored_column_then_blend():
         {"symbol": "AAA", "score_date": "20250102", "composite_growth_cycle_score": 90, "growth_score": 1, "cycle_score": 1},
         {"symbol": "BBB", "score_date": "20250102", "growth_score": 100, "cycle_score": 0},
     ]
-    rows = baseline_score_rows(docs)
+    rows = baseline_score_rows(docs, score_column="composite_growth_cycle_score")
     by_symbol = {row["ts_code"]: row["score"] for row in rows}
     assert by_symbol["AAA"] == 90
     assert by_symbol["BBB"] == 60
     assert top_n_symbols(rows, score_key="score", n=1) == ["AAA"]
+
+
+def test_baseline_defaults_to_the_self_computed_blend():
+    """The contract scores track A itself: production has no composite column."""
+    docs = [{"symbol": "AAA", "score_date": "20250102", "composite_growth_cycle_score": 90, "growth_score": 100, "cycle_score": 50}]
+    assert baseline_score_rows(docs)[0]["score"] == 80
 
 
 def test_shadow_live_skips_backfill():
@@ -28,6 +51,34 @@ def test_shadow_live_skips_backfill():
     rows = resolve_model_scores(live, panel=None, params={}, as_of="20250120")
     assert rows[0]["score_source"] == "shadow_live"
     assert rows[0]["score"] == 1.5
+
+
+def test_shadow_live_rows_for_other_dates_are_not_this_day():
+    live = [{"ts_code": "AAA", "trade_date": "20250119", "score": 1.5}]
+    with pytest.raises(ValueError, match="no shadow scores on 20250120"):
+        resolve_model_scores(live, panel=None, params={}, as_of="20250120")
+
+
+def test_one_stray_live_row_cannot_displace_a_backfilled_day():
+    """The boundary is a date, not a row count (DEMO doc section 1.1)."""
+    days = [f"20250{i:03d}" for i in range(101, 181)]
+    panel = _pit_panel(days)
+    as_of = days[-2]
+    stray = [{"ts_code": "AAA", "trade_date": as_of, "score": 9.9}]
+    rows = resolve_model_scores(
+        stray,
+        panel,
+        {"model_kind": "ridge", "feature_names": ["growth_score"]},
+        as_of,
+        shadow_live_from=days[-1],
+    )
+    assert {row["score_source"] for row in rows} == {"backfill_pit"}
+    assert len(rows) == 2
+
+
+def test_a_live_day_never_falls_back_to_a_refit():
+    with pytest.raises(ValueError, match="refusing to backfill"):
+        resolve_model_scores([], panel=None, params={}, as_of="20250120", shadow_live_from="20250101")
 
 
 def test_truncate_panel_drops_future_dates():

@@ -28,10 +28,15 @@
 | 主指标 | 扣成本后**中性化 IC / rank-IC**、TOP-K 相对池等权的**逐日**超额 | 协议「成本」「模型晋级」两节 |
 | 次指标 | 净值、回撤、换手 —— **仅作沟通**，须标注独立期数（n≈12/年）无统计功效 | — |
 | 对照轨 | **R**：随机分数，相对池等权超额应 ≈ 0（否则 harness 有泄漏或记账错） | 协议置换检验 |
+| 缺失截面 | 信号日**无可用截面** ⇒ 顺延上一期持仓，换手与成本均为 0（不空仓、不算新开仓） | B1 |
+| 前瞻未完成 | 持仓**无 T+20 收益** ⇒ 该期剔出 NAV 并计入 `dropped_periods`（不作为 0 收益复合） | B1 |
+| 部分定价 | 仅部分持仓有收益 ⇒ 在**有报价子集**上取均值，同时计入 `partial_periods` | B1 |
 | 窗口 | 默认 **504 交易日（2 年）**，另支持 `start/end` 显式区间 | — |
 | 结束日 | 基线：`max(score_date)`（hs300）；模型：与 A 调仓日交集 | — |
 
 **指标优先级**：主证据是 IC / top-K 逐日超额（约 250 日 × 300 名 ≈ 7.5 万观测，有功效）；净值差只能作为**同名调仓日配对**的统计量，附置换/bootstrap p 值。1 年窗口的净值差**不足以**支持任何「模型更好」的结论。
+
+**R 轨的零假设是 gross 的**：R 也要付成本，用净收益去检验「≈ 0」等于在检验成本模型而非记账；判据取 `gross_t_stat`（|t| ≤ 3），成本作为两条轨都付的确定性拖累另列。窗口不足时 R 会**报错而不是缩窗口**（B1）。
 
 **调仓周期与标签的错配**：标签 horizon 是 20 日，实盘调仓是 30 日。主口径取 20 日（与标签一致），30 日作为「实盘会拿到什么」的敏感性 —— 若 20 日口径都赢不了，30 日不必看。
 
@@ -170,7 +175,7 @@ Forward **8–12 周 Shadow 观察**若要做，须在**本机**新起（本机 
 | 批次 | 内容 | 规模 | 验收 |
 |------|------|------|------|
 | **B0** | 冻结本契约（本节 §1）；修 doc 内的失实表述 | 0.5d | 本文件 |
-| **B1** | 修 demo 记账 bug：缺失截面=持仓不变且不计换手（区分「无截面」与「前瞻未完成」）、末段不完整期剔出 NAV、`--score-column` 真正生效、`--years` 不足时明确报错；清死代码 | 1d | 单测 + 对照轨 R 相对池等权超额 ≈ 0 |
+| **B1** ✅ | 修 demo 记账 bug：缺失截面=持仓不变且不计换手（区分「无截面」与「前瞻未完成」）、末段不完整期剔出 NAV、`--score-column` 真正生效、`--years` 不足时明确报错；清死代码；落地对照轨 **R** 与成本 27bps | 1d | 单测 51 全绿 + 对照轨 R 相对池等权超额 ≈ 0（且池带溢价时**必须报警**） |
 | **B2** | A 轨端到端：读 `stock_scores`（as-of 成员）→ 20 日调仓 → 主指标 + 净值；与 `ScoreBacktester.calculate_topk_summary` 同参逐日对账 | 1d | `top_vs_universe` / `universe_mean_return` 逐日一致 |
 | **B3a** | **本机跑通训练闭环**：物化 hs300 快照（本机 `stock_scores` + `volume_price` → 本机 parquet root）→ 提交本机 job → worker 训练 → 本机 `quant_ml` 产出 `model_id` 与 `model_predictions` | 1d | 本机 `model_training_results` 有结果；快照落在 `apps/data/quant_ml/parquet` |
 | **B3b** | B 轨接本机 `quant_ml`：按 `shadow_live_from` **日期**切片；backfill 换协议口径（purge=60 + 本机 job 配方）；重叠期 rank correlation | 1.5d | 重叠期相关性达标 |
@@ -202,22 +207,32 @@ Forward **8–12 周 Shadow 观察**若要做，须在**本机**新起（本机 
 | 本机从未训练过（`quant_ml` 空），B 轨无现成分可用 | B3a 先跑通本机闭环；A 轨与 harness（R 轨）不依赖 B 轨，可并行落地 |
 | 本机 PIT backfill 计算量（每调仓日一次 refit） | 先实测单次 refit 耗时再定窗口深度；必要时降频或复用物化面板截断 |
 | 训练标签（20d demean 超额）与实盘调仓（30d）错配 | 主口径 20d；30d 只作敏感性并标注错配 |
-| `--years` 数据不足被静默降级 | B1 起改为显式报错 / 明确 warn |
+| ~~`--years` 数据不足被静默降级~~ | ✅ B1 已改为**显式报错**（`window_trading_days` 抛出可用天数与区间，CLI 退出码 2） |
+| 单条 shadow 行顶掉整段 backfill | ✅ B1 已改为**按 `shadow_live_from` 日期切**；live 日缺分则**报错**而非回退 refit |
 
 ---
 
-## 8. CLI 草案
+## 8. CLI
+
+**已实现（B1）** —— 离线 `--bundle` / `--dates-file` 两条路径，零 Mongo 依赖：
 
 ```bash
 python -m quant_model_platform.tools.demo_hs300_20d_top20 \
-  --universe hs300 \
-  --start 20241001 --end 20261014 \
-  --top-n 10 \
-  --rebalance-days 20 \
-  --growth-cycle-weights 60:40 \
+  --bundle /tmp/bundle.json --years 2 \
+  --top-n 10 --rebalance-days 20 \
+  --score-column ""            # 空 = A 轨自算 60:40；命名则读 stock_scores 该列（B2 接上）
+  --control-seed 20261015      # R 轨可换种子复核，不必设开关：R 恒开
+  --out-dir /tmp/demo-hs300
+```
+
+**计划（B2/B4）** —— 直连 Mongo，`--start/--end` 显式区间与 `--universe` 参数化：
+
+```bash
+python -m quant_model_platform.tools.demo_hs300_20d_top20 \
+  --universe hs300 --start 20241001 --end 20261014 \
+  --top-n 10 --rebalance-days 20 --growth-cycle-weights 60:40 \
   --model-id promo-hs300-2bc005de \
   --source-job-id <从 model_training_jobs 读，勿手抄> \
-  --control-track random \
   --out-dir /tmp/demo-hs300
 ```
 

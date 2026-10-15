@@ -37,18 +37,23 @@ def growth_cycle_composite(growth: Optional[float], cycle: Optional[float], *, s
 def baseline_score_rows(
     docs: Sequence[Dict[str, Any]],
     *,
-    score_column: str = "composite_growth_cycle_score",
+    score_column: str = "",
     weights: str = "60:40",
 ) -> List[Dict[str, Any]]:
-    """One cross-section. Prefer a stored column; otherwise blend growth and cycle."""
+    """One cross-section. Reads ``score_column`` when named; blends otherwise.
+
+    The default is the self-computed blend, because the frozen contract scores
+    track A that way and ``stock_scores`` has no composite column in production
+    (docs/DEMO_HS300_20D_TOP20.md section 1.3).
+    """
     rows: List[Dict[str, Any]] = []
     for doc in docs:
         symbol = str(doc.get("symbol") or doc.get("ts_code") or "").strip()
         trade_date = str(doc.get("score_date") or doc.get("trade_date") or "")[:8]
         if not symbol or len(trade_date) != 8:
             continue
-        stored = doc.get(score_column)
-        if stored is None and isinstance(doc.get("scores"), dict):
+        stored = doc.get(score_column) if score_column else None
+        if stored is None and score_column and isinstance(doc.get("scores"), dict):
             stored = doc["scores"].get(score_column)
         try:
             score = float(stored) if stored is not None else None

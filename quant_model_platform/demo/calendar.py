@@ -12,11 +12,20 @@ def trading_days_per_year(years: int) -> int:
 
 
 def window_trading_days(all_days: Sequence[str], *, years: int = 1) -> List[str]:
-    """Last N unique sorted YYYYMMDD strings (N = 252 or 504)."""
+    """Last N unique sorted YYYYMMDD strings (N = 252 or 504).
+
+    Raises when the history is shorter than the window instead of quietly
+    returning what it has: a silent short window makes the report claim two
+    years over one year of data (docs/DEMO_HS300_20D_TOP20.md section 5, B1).
+    """
     days = sorted({str(d)[:8] for d in all_days if str(d).strip()})
     n = trading_days_per_year(years)
     if len(days) < n:
-        return days
+        span = f"{days[0]}..{days[-1]}" if days else "no dates at all"
+        raise ValueError(
+            f"requested {n} trading days ({years}y) but only {len(days)} available ({span}); "
+            "pass a longer history or a smaller --years"
+        )
     return days[-n:]
 
 
