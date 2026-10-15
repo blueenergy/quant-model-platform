@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from datetime import datetime
+from quant_model_platform.timeutil import utcnow
 
 from quant_model_platform.db import COLLECTION_SHADOW_PROFILES, ensure_ml_indexes, get_ml_collections
 from quant_model_platform.queue import clean_for_mongo
@@ -40,12 +40,12 @@ def main(argv=None) -> int:
                 "snapshot_id": merged.get("snapshot_id"),
                 "model_kind": merged.get("model_kind"),
             },
-            "updated_at": datetime.utcnow(),
+            "updated_at": utcnow(),
         }
     )
     collections[COLLECTION_SHADOW_PROFILES].update_one(
         {"profile_id": args.profile_id},
-        {"$set": doc, "$setOnInsert": {"created_at": datetime.utcnow()}},
+        {"$set": doc, "$setOnInsert": {"created_at": utcnow()}},
         upsert=True,
     )
     print(f"profile_id={args.profile_id} model_id={merged.get('model_id')} index_code={merged.get('index_code')}")

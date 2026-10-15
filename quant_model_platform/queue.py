@@ -11,18 +11,16 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from pymongo import ASCENDING, ReturnDocument
 from pymongo.errors import PyMongoError
 
+from quant_model_platform.timeutil import utcnow
+
 log = logging.getLogger(__name__)
-
-
-def utcnow() -> datetime:
-    return datetime.utcnow()
 
 
 def clean_for_mongo(value: Any) -> Any:

@@ -6,7 +6,7 @@ import hashlib
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from quant_model_platform.timeutil import utcnow
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -95,7 +95,7 @@ def build_manifest(
         pit_policy=pit_policy,
         parquet_uri=uri,
         row_count=int(len(frame)),
-        created_at=datetime.utcnow(),
+        created_at=utcnow(),
     )
 
 

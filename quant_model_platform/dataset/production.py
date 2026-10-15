@@ -157,7 +157,7 @@ def build_production_panel(
     """Build PIT score panel + forward labels; write parquet under parquet_dir."""
     cfg = config or PlatformConfig.from_env()
     own_client = client is None
-    mongo = client or MongoClient(cfg.mongo_uri)
+    mongo = client or MongoClient(cfg.mongo_uri, tz_aware=True)
     try:
         score_rows = load_stock_score_rows(
             mongo,

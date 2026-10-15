@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from quant_model_platform.timeutil import utcnow
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -37,7 +37,7 @@ def run_shadow_batch_synthetic(params: Dict[str, Any], config: PlatformConfig) -
     day = panel.loc[panel["trade_date"] == as_of].copy()
     day["score"] = predict_model(day, model)
     records: List[Dict[str, Any]] = []
-    now = datetime.utcnow()
+    now = utcnow()
     for _, row in day.iterrows():
         records.append(
             {

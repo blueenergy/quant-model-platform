@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
+from quant_model_platform.timeutil import utcnow
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -66,7 +66,7 @@ def run_shadow_batch(params: Dict[str, Any], config: PlatformConfig, *, collecti
     preds = cols[COLLECTION_PREDICTIONS]
     preds.delete_many({"model_id": model_id, "trade_date": as_of})
 
-    now = datetime.utcnow()
+    now = utcnow()
     records: List[Dict[str, Any]] = []
     for _, row in day.iterrows():
         records.append(

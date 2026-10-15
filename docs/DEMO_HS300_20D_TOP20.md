@@ -144,7 +144,7 @@ Forward **8–12 周 Shadow 观察**若要做，须在**本机**新起（本机 
 | 存量训练产物 | ❌ 从未训练过（`quant_ml` 6 集合，除 worker_status 外全 0） |
 | 资源 | 宿主 16 vCPU；trainer 限额 4 vCPU / 32 GB |
 
-> 注意：本机 Mongo 返回的是 **naive UTC**，而宿主 `date` 是 CST（+8）。比对心跳/`created_at` 时必须 +8，否则会把「5 秒前」误读成「8 小时前」。
+> 时区约定（2026-10-15 统一）：库内时间戳一律 **UTC**；平台**读侧已开 `tz_aware=True`**、**写侧统一走 `timeutil.utcnow()`**，新代码拿到的是 **aware UTC**，显示用 `timeutil.to_cst()`。若用裸 pymongo（未开 tz_aware）读，拿到的是 **naive UTC**，直接和宿主 `date`（CST，+8）相减会差 8 小时 —— 足以把「5 秒前」的心跳误判成「停摆 8 小时」。
 
 **窗口含义**：score 数据从 2015-01 起，样本充分。默认 2 年是**快速迭代**取向，不是数据上限。
 

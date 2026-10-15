@@ -21,7 +21,9 @@ _CHANNEL_INDEX = "index_code_1_channel_1"
 
 def get_ml_client(config: PlatformConfig | None = None) -> MongoClient:
     cfg = config or PlatformConfig.from_env()
-    return MongoClient(cfg.mongo_uri)
+    # tz_aware: BSON dates carry no timezone and decode naive by default, which
+    # reads as local wall-clock time. Hand back aware UTC instead — see timeutil.
+    return MongoClient(cfg.mongo_uri, tz_aware=True)
 
 
 def get_ml_collections(client: MongoClient | None = None, config: PlatformConfig | None = None) -> Dict[str, Any]:

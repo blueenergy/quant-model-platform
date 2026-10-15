@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from datetime import datetime
+from quant_model_platform.timeutil import utcnow
 from pathlib import Path
 
 from quant_model_platform.config import PlatformConfig
@@ -78,7 +78,7 @@ def main(argv=None) -> int:
                 **manifest.to_mongo(),
                 "parquet_path": uri,
                 "parquet_uri": uri,
-                "updated_at": datetime.utcnow(),
+                "updated_at": utcnow(),
             }
         )
         if args.canonical:
@@ -87,12 +87,12 @@ def main(argv=None) -> int:
             doc.pop("created_at", None)
             collections[COLLECTION_DATASETS].update_one(
                 {"snapshot_id": canonical_snapshot_id(args.index_code)},
-                {"$set": doc, "$setOnInsert": {"created_at": datetime.utcnow()}},
+                {"$set": doc, "$setOnInsert": {"created_at": utcnow()}},
                 upsert=True,
             )
             print(f"upserted dataset_manifests snapshot_id={manifest.snapshot_id} channel={PRODUCTION_CURRENT_CHANNEL}")
         else:
-            doc["created_at"] = datetime.utcnow()
+            doc["created_at"] = utcnow()
             collections[COLLECTION_DATASETS].insert_one(doc)
             print(f"registered dataset_manifests snapshot_id={manifest.snapshot_id}")
 

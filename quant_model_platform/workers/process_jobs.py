@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
+from quant_model_platform.timeutil import utcnow
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -37,7 +37,7 @@ def process_model_training_job(
         result_doc = {
             **result,
             "job_id": job_id,
-            "created_at": datetime.utcnow(),
+            "created_at": utcnow(),
         }
         collections[COLLECTION_RESULTS].insert_one(clean_for_mongo(result_doc))
         queue.complete(job_id, result_id=result["result_id"])
@@ -57,7 +57,7 @@ def enqueue_synthetic_job(collections: Dict[str, Any], *, user_id: str = "system
         "user_id": user_id,
         "name": "synthetic-mvp",
         "status": "pending",
-        "created_at": datetime.utcnow(),
+        "created_at": utcnow(),
         "params": {"index_code": "csi1000", "model_kind": model_kind, "universe_count": 2},
     }
     collections[COLLECTION_JOBS].insert_one(doc)
