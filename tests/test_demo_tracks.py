@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from quant_model_platform.db import COLLECTION_PREDICTIONS
+from quant_model_platform.db import COLLECTION_PREDICTIONS, COLLECTION_RESULTS
 from quant_model_platform.demo.backfill_pit import pit_train_dates, predict_cross_section_as_of, truncate_panel
 from quant_model_platform.demo.ranking import top_n_symbols
 from quant_model_platform.demo.track_a import baseline_score_rows, growth_cycle_composite
@@ -10,6 +10,7 @@ from quant_model_platform.demo.track_b import (
     load_shadow_predictions,
     resolve_model_scores,
     scores_by_day,
+    training_evidence,
 )
 from quant_model_platform.protocol import LABEL_HORIZON_DAYS, MAX_PURGE_DAYS
 
@@ -230,3 +231,104 @@ def test_overlap_ignores_days_only_one_side_has():
     assert report["shared_days"] == 0
     assert report["days"] == []
     assert report["passes"] is False
+
+
+class _FakeResults:
+    """Minimal stand-in for quant_ml.model_training_results."""
+
+    def __init__(self, docs):
+        self.docs = list(docs)
+        self.queries = []
+
+    def find_one(self, query, projection=None, sort=None):
+        self.queries.append((query, sort))
+        for doc in self.docs:
+            if all(doc.get(key) == want for key, want in query.items()):
+                return doc
+        return None
+
+
+def _training_result(**overrides):
+    doc = {
+        "job_id": "job-1",
+        "result_id": "res-1",
+        "created_at": "2026-10-01T00:00:00",
+        "model_kind": "ridge",
+        "code_version": "sha-00a4f45",
+        "snapshot_id": "snap-1",
+        "artifact_hash": "deadbeef",
+        "promotion": {"passed": False, "reason": "ic_below_baseline", "model_mean_ic": 0.0234},
+        "permutation_p": 0.31,
+        "baseline_ic": {"mean_ic": 0.0493},
+        "fold_reports": [
+            {"model": {"mean_ic": 0.02, "avg_turnover": 0.5, "n_days": 100},
+             "baseline": {"mean_ic": 0.05, "avg_turnover": 0.4, "n_days": 100}},
+            {"model": {"mean_ic": 0.03, "avg_turnover": 0.3, "n_days": 80},
+             "baseline": {"mean_ic": 0.07, "avg_turnover": 0.2, "n_days": 80}},
+        ],
+    }
+    doc.update(overrides)
+    return doc
+
+
+def test_training_evidence_quotes_the_verdict_it_was_given():
+    """The gate judged this run; the demo repeats the judgement, it does not retry it."""
+    collections = {COLLECTION_RESULTS: _FakeResults([_training_result()])}
+
+    block = training_evidence(collections, job_id="job-1")
+
+    assert block["promotion"] == {"passed": False, "reason": "ic_below_baseline", "model_mean_ic": 0.0234}
+    assert block["artifact_hash"] == "deadbeef"
+    assert block["result_id"] == "res-1"
+    assert block["comparable_to_primary"] is False
+    # 272 fold rows already live in Mongo; copying them into a one-shot output
+    # directory is the duplication the aggregate-into-JSON rule exists to avoid.
+    assert "fold_reports" not in block  # the 272 raw rows stay in Mongo
+
+
+def test_training_evidence_reduces_the_folds_the_way_the_gate_does():
+    """Its mean has to be the number the gate compared, not a neighbour of it."""
+    collections = {COLLECTION_RESULTS: _FakeResults([_training_result()])}
+
+    folds = training_evidence(collections, job_id="job-1")["folds"]
+
+    assert folds["model"]["mean_ic"] == pytest.approx(0.025)
+    assert folds["baseline"]["mean_ic"] == pytest.approx(0.06)
+    assert folds["model_minus_baseline"] == pytest.approx(-0.035)
+    assert folds["model"]["sd_ic"] == pytest.approx(0.0070711, abs=1e-6)
+    assert folds["model"]["share_positive"] == 1.0
+    assert folds["model"]["n_days_summed"] == 180
+    # The pooled baseline the gate compared against is quoted as it stands, not
+    # recomputed: the fold mean above and this number are two different averages
+    # of nearly the same data, which is why the note has to say so.
+    assert training_evidence(collections, job_id="job-1")["baseline_ic"] == {"mean_ic": 0.0493}
+
+
+@pytest.mark.parametrize(
+    "collections, job_id",
+    [
+        ({COLLECTION_RESULTS: _FakeResults([_training_result()])}, ""),
+        ({COLLECTION_RESULTS: _FakeResults([_training_result()])}, "job-unknown"),
+        ({COLLECTION_RESULTS: _FakeResults([])}, "job-1"),
+        ({}, "job-1"),
+    ],
+)
+def test_training_evidence_degrades_instead_of_raising(collections, job_id):
+    """A missing audit trail must not stop the measurement it annotates."""
+    assert training_evidence(collections, job_id=job_id) is None
+
+
+def test_training_evidence_skips_folds_with_no_ic():
+    collections = {
+        COLLECTION_RESULTS: _FakeResults(
+            [_training_result(fold_reports=[{"model": {"mean_ic": None}, "baseline": {"mean_ic": 0.05}}])]
+        )
+    }
+
+    folds = training_evidence(collections, job_id="job-1")["folds"]
+
+    assert folds["model"]["n_folds"] == 0
+    assert folds["model"]["mean_ic"] is None
+    assert folds["model"]["sd_ic"] is None
+    assert folds["model_minus_baseline"] is None  # not a number invented from one side
+    assert folds["baseline"]["mean_ic"] == pytest.approx(0.05)

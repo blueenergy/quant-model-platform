@@ -11,14 +11,46 @@ from scipy import stats
 from quant_model_platform.protocol import DEFAULT_SLIPPAGE_BPS
 
 
-def spearman_ic(frame: pd.DataFrame, score_col: str, label_col: str, date_col: str = "trade_date") -> pd.Series:
+#: Fewest usable names a date needs before its IC is reported. Dates below it
+#: yield NaN rather than a correlation off a handful of names.
+MIN_IC_NAMES = 5
+
+
+def cross_sectional_ic(
+    frame: pd.DataFrame,
+    score_col: str,
+    label_col: str,
+    *,
+    date_col: str = "trade_date",
+    method: str = "spearman",
+    min_names: int = MIN_IC_NAMES,
+) -> pd.Series:
+    """Per-date cross-sectional correlation between a score and a label.
+
+    The single IC definition in this package. ``method`` goes straight to
+    :meth:`pandas.Series.corr`: ``"spearman"`` ranks first, ``"pearson"`` does
+    not, so the two differ on how much an extreme name is allowed to matter --
+    and in nothing else.
+
+    Neither flavour moves under a per-date shift of the label. Both are
+    invariant under adding a constant, and a "pool demean" subtracts one
+    constant per date, so a demeaned IC and a raw IC are the same number. Only
+    *level* statistics (a pool mean, a top-K excess, a NAV measured against the
+    pool) change. ``demo/primary.py`` relies on that and pins it with a test.
+    """
+
     def _ic(group: pd.DataFrame) -> float:
         sub = group[[score_col, label_col]].dropna()
-        if len(sub) < 5:
+        if len(sub) < min_names:
             return np.nan
-        return float(sub[score_col].corr(sub[label_col], method="spearman"))
+        return float(sub[score_col].corr(sub[label_col], method=method))
 
     return frame.groupby(date_col, sort=False).apply(_ic)
+
+
+def spearman_ic(frame: pd.DataFrame, score_col: str, label_col: str, date_col: str = "trade_date") -> pd.Series:
+    """Rank IC per date; see :func:`cross_sectional_ic`."""
+    return cross_sectional_ic(frame, score_col, label_col, date_col=date_col)
 
 
 def benjamini_hochberg(p_values: Sequence[float], alpha: float = 0.05) -> Tuple[np.ndarray, np.ndarray]:

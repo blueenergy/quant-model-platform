@@ -18,6 +18,7 @@ import math
 from statistics import pstdev
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from quant_model_platform.demo.primary import daily_metrics, pool_symbols_by_date, summarize_primary
 from quant_model_platform.demo.ranking import random_control_scores, top_n_symbols
 
 #: Fees 7 bps round trip + 10 bps slippage a side.
@@ -171,23 +172,26 @@ def compare_tracks(
     hold_days: int = 20,
     score_column_a: str = "",
     control_seed: int = CONTROL_SEED,
+    trading_days: Sequence[str] = (),
+    horizon_declared_by: str = "rebalance_days",
 ) -> Dict[str, Any]:
     """Track A (rules), track B (model) and track R (random control).
 
     R ranks a random permutation of the same pool on the same dates through the
     same cost model, so its pool-relative excess has zero expectation: a
     nonzero one is a harness defect, not a result.
+
+    R's scores are drawn here and handed to both the equity engine and the
+    primary-evidence block, so there is exactly one definition of the control
+    track and it cannot drift between the two. ``trading_days`` is the window
+    calendar, used only to measure whether the signal grid's return windows
+    actually do avoid each other.
     """
     track_a = simulate_track(signal_dates, scores_a, forward_returns, top_n=top_n, track="baseline")
     track_b = simulate_track(signal_dates, scores_b, forward_returns, top_n=top_n, track="model")
     pool = scores_a or scores_b
-    track_r = simulate_track(
-        signal_dates,
-        random_control_scores(pool, seed=control_seed),
-        forward_returns,
-        top_n=top_n,
-        track="control_random",
-    )
+    random_scores = random_control_scores(pool, seed=control_seed)
+    track_r = simulate_track(signal_dates, random_scores, forward_returns, top_n=top_n, track="control_random")
     stats_a = equity_stats(track_a, hold_days=hold_days)
     stats_b = equity_stats(track_b, hold_days=hold_days)
     stats_r = equity_stats(track_r, hold_days=hold_days)
@@ -198,6 +202,22 @@ def compare_tracks(
     random_overlaps = [overlap_ratio(a["holdings"], r["holdings"]) for a, r in zip(track_a, track_r)]
     known = [value for value in overlaps if value is not None]
     known_random = [value for value in random_overlaps if value is not None]
+    pool_symbols, pool_sources = pool_symbols_by_date(scores_a, scores_b, signal_dates)
+    metrics_by_date = daily_metrics(
+        {"baseline": scores_a, "model": scores_b, "control_random": random_scores},
+        forward_returns,
+        {"baseline": track_a, "model": track_b, "control_random": track_r},
+        pool_symbols=pool_symbols,
+        pool_sources=pool_sources,
+    )
+    primary = summarize_primary(
+        metrics_by_date,
+        trading_days=trading_days,
+        hold_days=hold_days,
+        control_seed=control_seed,
+        control_t_max=CONTROL_T_MAX,
+        horizon_declared_by=horizon_declared_by,
+    )
     return {
         "track_a": {**public_a, "score_column": score_column_a or SELF_COMPUTED_SCORE},
         "track_b": public_b,
@@ -209,6 +229,8 @@ def compare_tracks(
             "avg_overlap_baseline_vs_random": (sum(known_random) / len(known_random)) if known_random else None,
         },
         "rebalances": track_a + track_b + track_r,
+        "metrics_by_date": metrics_by_date,
+        "primary": primary,
         "equity_curve": [
             {
                 "trade_date": day,

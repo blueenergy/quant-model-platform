@@ -45,6 +45,7 @@ from quant_model_platform.demo.track_b import (
     load_shadow_predictions,
     resolve_model_scores,
     scores_by_day,
+    training_evidence,
 )
 from quant_model_platform.protocol import MAX_PURGE_DAYS
 from quant_model_platform.shadow.resolve import merge_job_into_shadow_params
@@ -94,6 +95,42 @@ def _write_rebalances_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
             out = dict(row)
             out["holdings"] = " ".join(row.get("holdings") or [])
             writer.writerow(out)
+
+
+def _write_metrics_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    """Daily primary evidence, one row per (date, track).
+
+    The pool columns repeat on every row rather than being stated once in the
+    header: a benchmark that changes halfway down the file would then be
+    impossible to miss, and the file stays readable on its own. An absent number
+    -- no IC on a carried date, no excess on an unpriced one -- is written as an
+    empty cell, not as the string ``None``, which would read back as a category.
+    """
+    fieldnames = [
+        "trade_date",
+        "track",
+        "pool_basis",
+        "n_pool",
+        "pool_return",
+        "pool_return_wide",
+        "n_wide",
+        "n_scored",
+        "n_joined",
+        "n_priced",
+        "pricing",
+        "carried",
+        "ic_rank",
+        "ic_pearson",
+        "topk_mean",
+        "excess_gross",
+        "cost",
+        "excess_net",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: ("" if row.get(key) is None else row.get(key)) for key in fieldnames})
 
 
 def _resolve_window(days: Any, *, years: int) -> Optional[List[str]]:
@@ -191,7 +228,19 @@ def _emit_report(
         hold_days=args.rebalance_days,
         score_column_a=args.score_column,
         control_seed=args.control_seed,
+        trading_days=window,
+        # A bundle carries forward returns built by whoever wrote it, at a
+        # horizon only the flag can name; --from-mongo builds them from that
+        # same flag, so there the label is a fact rather than an assumption.
+        horizon_declared_by="rebalance_days" if args.from_mongo else "rebalance_days (assumed; a bundle declares none)",
     )
+    primary = report["primary"]
+    if not primary["power"]["n_dates"] or not primary["join"]["joined_names"]:
+        print(
+            "warning: the primary evidence is empty -- no dated cross-section joined to a forward "
+            "return -- so only the NAV-level metrics below mean anything",
+            file=sys.stderr,
+        )
     summary = {
         "demo_id": _demo_id(args, index_code, window),
         "status": "equity",
@@ -205,6 +254,8 @@ def _emit_report(
         "source": source or _source_block(args),
         "model_source": payload.get("model_source"),
         "model_overlap": payload.get("model_overlap"),
+        "model_training": payload.get("model_training"),
+        "primary": primary,
         "cost": _cost_block(),
         "window_start": window[0] if window else None,
         "window_end": window[-1] if window else None,
@@ -229,6 +280,7 @@ def _emit_report(
         (args.out_dir / "summary.json").write_text(text + "\n", encoding="utf-8")
         _write_equity_csv(args.out_dir / "equity_curve.csv", report["equity_curve"])
         _write_rebalances_csv(args.out_dir / "rebalances.csv", report["rebalances"])
+        _write_metrics_csv(args.out_dir / "metrics_by_date.csv", report["metrics_by_date"])
         # Last, so its digest list covers everything else in the directory.
         metadata = build_provenance(
             args=args,
@@ -297,7 +349,13 @@ def _model_context(args: argparse.Namespace, cfg: PlatformConfig, *, index_code:
             "shadow_live_from": args.shadow_live_from or None,
         }
     )
-    return {"panel": panel, "params": params, "live_rows": live, "provenance": provenance}
+    # What the source job concluded about its own model travels with the demo
+    # output: the evidence into the summary, its two identifiers into the
+    # provenance record. Neither is recomputed here.
+    training = training_evidence(collections, job_id=args.source_job_id)
+    if training:
+        provenance.update({"result_id": training["result_id"], "artifact_hash": training["artifact_hash"]})
+    return {"panel": panel, "params": params, "live_rows": live, "provenance": provenance, "training": training}
 
 
 def _model_scores(
@@ -416,6 +474,7 @@ def _run_mongo(args: argparse.Namespace) -> int:
         payload["trading_days"] = days
         if context:
             payload["model_source"] = context["provenance"]
+            payload["model_training"] = context["training"]
             if args.check_overlap:
                 payload["model_overlap"] = _overlap_report(
                     context, signals, payload["scores_b"], purge=args.backfill_purge

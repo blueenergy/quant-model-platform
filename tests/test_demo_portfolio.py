@@ -1,3 +1,4 @@
+import csv
 import json
 import random
 from pathlib import Path
@@ -251,7 +252,55 @@ def test_cli_writes_the_provenance_of_its_own_outputs(tmp_path: Path):
         "summary.json",
         "equity_curve.csv",
         "rebalances.csv",
+        "metrics_by_date.csv",
     }
+
+
+def test_cli_writes_the_primary_block(tmp_path: Path):
+    """The metric the contract calls primary, end to end through the CLI."""
+    days = [f"2025{i:04d}" for i in range(1, 261)]
+    out = tmp_path / "out"
+
+    code = main(["--bundle", str(_write_bundle(tmp_path, days)), "--years", "1", "--out-dir", str(out)])
+
+    assert code == 0
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    primary = summary["primary"]
+    # 13 rebalances on the 252-day window: few enough that the MDE is huge, which
+    # is the honest thing for this fixture to report.
+    assert primary["power"]["n_dates"] == primary["grid"]["n_dates"] == 13
+    assert primary["power"]["effective_n"] == 13
+    assert primary["grid"]["non_overlapping"] is True
+    assert primary["pool"]["basis"] == "day_cross_section"
+    assert primary["control"]["passed"] is True
+    assert primary["tracks"]["baseline"]["rank_ic"]["n_dates"] == 13
+
+    with (out / "metrics_by_date.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 3 * 13
+    assert {row["track"] for row in rows} == {"baseline", "model", "control_random"}
+    # The CSV is written from the same rows the summary is derived from, so the
+    # two cannot disagree -- if this drifts, one of them grew a second source.
+    baseline_excess = [
+        float(row["excess_gross"]) for row in rows if row["track"] == "baseline" and row["excess_gross"] != ""
+    ]
+    assert len(baseline_excess) == 13
+    assert sum(baseline_excess) / len(baseline_excess) == pytest.approx(
+        primary["tracks"]["baseline"]["topk_excess_gross_vs_pool"]["mean"]
+    )
+    assert not [row for row in rows if "None" in row.values()]
+
+
+def test_cli_degrades_without_a_source_job(tmp_path: Path):
+    """No source job means no training evidence to quote -- and no failure."""
+    days = [f"2025{i:04d}" for i in range(1, 261)]
+    out = tmp_path / "out"
+
+    code = main(["--bundle", str(_write_bundle(tmp_path, days)), "--years", "1", "--out-dir", str(out)])
+
+    assert code == 0
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert summary["model_training"] is None
 
 
 def test_cli_errors_instead_of_shrinking_the_window(tmp_path: Path, capsys):
