@@ -49,13 +49,13 @@
 | 本机 Shadow 启用之后 | 本机 `quant_ml.model_predictions` | `score_source=shadow_live` |
 | 更早调仓日 | 本机 **PIT backfill**（见 §4），按协议 purge=60 | `score_source=backfill_pit` |
 
-⚠️ 本机 `quant_ml` 现为**空库**（`model_training_jobs` / `results` / `predictions` / `manifests` 全 0，从未在本机训练过）⇒ **没有现成 `model_id` 可引用**，B 轨第一步必须是在本机跑通一次训练（§5 B3a）。
+⚠️ ~~本机 `quant_ml` 现为空库~~ → **2026-10-15 起已有本机产物**：B3a 跑通训练闭环（job / result / 规范快照），B3b 跑通 shadow（`model_predictions` 300 条）。B 轨的 `model_id` 由本机 job 派生（`promo-{index}-{short_job}`），**不引用任何远端 `model_id`**。
 
 **边界按日期切，不按「当天有没有分」切** —— 半覆盖的截面不得当完整截面用。
 
 **禁止**：用「全历史 Parquet 一次 refit」给所有过去 T 打分（未来信息泄漏）。  
-Forward **8–12 周 Shadow 观察**若要做，须在**本机**新起（本机 `MODEL_SHADOW_PROFILES` 目前未设），且只认 `shadow_live` 段，不能用 backfill 冒充。  
-**可测替代**：在 Shadow 与 backfill 重叠的调仓日做 rank correlation —— 复现得好，长曲线才可信（§5 B3b）。
+Forward **8–12 周 Shadow 观察**若要做，须在**本机**新起（本机 `model_shadow_profiles` 已登记 `hs300-20d-ridge`，日更尚未挂 cron），且只认 `shadow_live` 段，不能用 backfill 冒充。  
+**可测替代**：在 Shadow 与 backfill 重叠的调仓日做 rank correlation —— 复现得好，长曲线才可信（B3b 已落地，结果见 §5.2）。
 
 ### 1.2 成本口径（2026-10-15 核实）
 
@@ -159,7 +159,7 @@ demo 侧**不复用**平台这段代码（`demo/sources.py` 自带 as-of 因子 
 | 价量 | ✅ `quant_data.volume_price` **1447 万条，2010-01-04 → 2026-10-15** |
 | Parquet 落地 | ✅ **文件系统** `/data/quant_ml/parquet`（bind mount `quant-infrastructure/apps/data/quant_ml`，可写）；**本机无 S3/MinIO 依赖** |
 | 提交入口 | ✅ 本机 `quant-api`：`POST /api/model-training/jobs` 等 6 条路由 |
-| 存量训练产物 | B3a 前 ❌ 从未训练过（`quant_ml` 6 集合，除 worker_status 外全 0）；**B3a 后** ✅ 本机已产出 job / result / manifest，`model_predictions` 仍 0（`MODEL_SHADOW_PROFILES` 未设） |
+| 存量训练产物 | B3a 前 ❌ 从未训练过（`quant_ml` 6 集合，除 worker_status 外全 0）；**B3a 后** ✅ job / result / 规范快照；**B3b 后** ✅ `model_predictions` 300 条（`model_id=promo-hs300-b7618410`，`trade_date=20261014`），`model_shadow_profiles` 1 条 |
 | 资源 | 宿主 16 vCPU；trainer 限额 4 vCPU / 32 GB |
 
 > 时区约定（2026-10-15 统一）：库内时间戳一律 **UTC**；平台**读侧已开 `tz_aware=True`**、**写侧统一走 `timeutil.utcnow()`**，新代码拿到的是 **aware UTC**，显示用 `timeutil.to_cst()`。若用裸 pymongo（未开 tz_aware）读，拿到的是 **naive UTC**，直接和宿主 `date`（CST，+8）相减会差 8 小时 —— 足以把「5 秒前」的心跳误判成「停摆 8 小时」。
@@ -172,14 +172,16 @@ demo 侧**不复用**平台这段代码（`demo/sources.py` 自带 as-of 因子 
 
 ## 4. Backfill（B 轨历史段）
 
-对每个调仓日 **T**（仅当该日无 `shadow_live` 分，或显式 `--force-backfill`）：
+对每个调仓日 **T**（该日 < `--shadow-live-from`；live 日缺分**报错**，不回退 refit）：
 
-1. 从本机 `finance.stock_scores` + `quant_data.volume_price` 拼 **PIT 面板**（`trade_date <= T`），或复用物化 Parquet 后截断到 T。
-2. 取**本机训练 job 的配方**（`model_kind` / `feature_names` / `model_params`，从本机 `quant_ml.model_training_jobs` 读），在可算标签的样本上 refit：面板截断到 T，且训练窗末再退 **purge = 60 交易日**（协议 `MAX_PURGE_DAYS`，复用 `evaluation/walk_forward.py` 的口径，勿自写）。
+1. 从本机 `finance.stock_scores` + `quant_data.volume_price` 拼 **PIT 面板**（`trade_date <= T`），或复用物化 Parquet 后截断到 T（`--source-job-id` 走**规范快照**）。
+2. 取**本机训练 job 的配方**（`model_kind` / `feature_names` / `model_params` / `label_col`，从本机 `quant_ml.model_training_jobs` 读，**不手抄**），在可算标签的样本上 refit：面板截断到 T，且训练窗末再退 **purge = 60 交易日**（协议 `MAX_PURGE_DAYS`，`demo/backfill_pit.py::pit_train_dates`）。
 3. 对**当日截面** `trade_date = T` 预测，标记 `score_source=backfill_pit`。
-4. **非调仓日不算分**（≈12 次 refit/年 × 池数）。
+4. **非调仓日不算分**（≈12 次 refit/年 × 池数；实测 13 个调仓日 + overlap 检查共 ~25 次 refit，端到端 **10s**）。
 
-**重叠期校验（必做）**：在 Shadow 与 backfill 都有的调仓日，比较两边分数的 rank correlation。复现不好 ⇒ 长曲线不可用于任何结论，只能当管道验证。
+> **purge 的双重身份（2026-10-15 补）**：`purge=60` 约束的是**评估切分**，不是实盘 refit —— 实盘 shadow 按定义用**全部有标签的行**（等效 `purge=0`，训练窗末 = T−21）。所以 backfill 与 live 分**本来就不是同一件事**，`--backfill-purge` 只是把这道差量摆到台面上（敏感性见 §5.2）。改这个值等于改 B 轨的口径，不是调优。
+
+**重叠期校验（必做，B3b 已落地）**：在 Shadow 与 backfill 都有的调仓日比较两边分数的 rank correlation（`--check-overlap`，判据 `MIN_OVERLAP_SPEARMAN=0.8`）。复现不好 ⇒ 长曲线不可用于任何结论，只能当管道验证。结果见 §5.2。
 
 ---
 
@@ -191,14 +193,14 @@ demo 侧**不复用**平台这段代码（`demo/sources.py` 自带 as-of 因子 
 | **B1** ✅ | 修 demo 记账 bug：缺失截面=持仓不变且不计换手（区分「无截面」与「前瞻未完成」）、末段不完整期剔出 NAV、`--score-column` 真正生效、`--years` 不足时明确报错；清死代码；落地对照轨 **R** 与成本 27bps | 1d | 单测 51 全绿 + 对照轨 R 相对池等权超额 ≈ 0（且池带溢价时**必须报警**） |
 | **B2** ✅ | A 轨端到端：`--from-mongo` 读 `stock_scores`（as-of 成员）+ `quant_data` hfq 价 → 调仓网格 + 三轨净值；与 `ScoreBacktester` 真码逐 (日期, 股票) 对账 | 1d | 见 §5.1 —— 收益层 8848/8850 逐位一致，聚合层 `universe_mean_return` 12/12 一致 |
 | **B3a** ✅ | **本机跑通训练闭环**：物化 hs300 快照（本机 `stock_scores` + `volume_price` → 本机 parquet root）→ 提交本机 job → worker 训练 | 1d | ✅ 快照落在 `apps/data/quant_ml/parquet`，`model_training_results` 已有结果（同参重跑 `artifact_hash` 一致 ⇒ 确定性）。⚠️ `model_predictions` 仍 0：本机未设 `MODEL_SHADOW_PROFILES`，预测段留给 B3b |
-| **B3b** | B 轨接本机 `quant_ml`：按 `shadow_live_from` **日期**切片；backfill 换协议口径（purge=60 + 本机 job 配方）；重叠期 rank correlation | 1.5d | 重叠期相关性达标 |
+| **B3b** ✅ | B 轨接本机 `quant_ml`：`--source-job-id` 解析**配方 + 规范快照**；backfill 换协议口径（purge=60）；读**真** `model_predictions`；重叠期 rank correlation | 1.5d | 见 §5.2 —— live/backfill ρ=0.8702（n=1 天，冒烟级）；**purge 敏感性：同一面板同一模型，B−A 可在 −10.03pp 与 +12.11pp/年之间取值** |
 | **B4** | 池参数化（hs300 / a500 / csi1000）、窗口 `start/end`、`metadata.json` provenance、与 `process_portfolio_research_jobs` 交叉校验 | 1.5d | 两条链路 A 轨一致 |
 
 后续（非 MVP）：API + UI；`MODEL_SCORE_ADAPTER` 走查；日频 NAV 与日频回撤。
 
 ### 5.1 B2 对账证据（2026-10-15，`5decfed`）
 
-跑法：trainer 容器里 `PYTHONPATH` 同时挂本仓、`stock-scoring-system`、`data-access-lib/src`，两边**读同一批 hfq 价**，`ScoreBacktester` 走自己的 `_load_symbol_price_history` + `_calculate_forward_returns`；窗口 hs300 20250923–20261014（252 个交易日、13 个调仓日）。
+跑法：trainer 容器里 `PYTHONPATH` 同时挂本仓、`stock-scoring-system`、`data-access-lib/src`，两边**读同一批 hfq 价**，`ScoreBacktester`（下称 **SBT**，`stock-scoring-system/analysis/core/score_backtester.py`，只作对账基准）走自己的 `_load_symbol_price_history` + `_calculate_forward_returns`；窗口 hs300 20250923–20261014（252 个交易日、13 个调仓日）。
 
 | 层 | 结果 |
 |----|------|
@@ -214,15 +216,46 @@ demo 侧**不复用**平台这段代码（`demo/sources.py` 自带 as-of 因子 
 
 > 对账基准刻意**不进入运行时依赖**（§3）：trainer 镜像只装本仓，`stock-scoring-system` 只在对账时挂进去。因此这条对账**不进 CI**，结论记录在本节与 vault。
 
+### 5.2 B3b 证据（2026-10-15）
+
+**B 轨现在真的接在本机 `quant_ml` 上**
+
+- **配方 + 面板**：`--source-job-id b7618410-…` → 与 shadow 走**同一个解析器**（`shadow.resolve.merge_job_into_shadow_params` + `load_training_panel`），拿到的是**规范快照** `hs300_current.parquet`（`snapshot_id=hs300-current`，147,000 行 = 490 日 × 300 名）。跑之前先核过：该文件与 B3a 的 job 快照 **md5 完全相同**（`f42a8386…`）⇒ 两次跑的 B 轨差**不来自面板**。
+- **真 live 分**：登记 `model_shadow_profiles/hs300-20d-ridge` → `python -m quant_model_platform.workers.shadow_loop --once` → `model_predictions` **300 条**（`model_id=promo-hs300-b7618410`，`trade_date=20261014`）。此前该集合恒为 0。
+- **切片**：本跑 `--shadow-live-from 20261014`，13 个调仓日全部早于边界 ⇒ B 轨仍全走 backfill；live 段要等本地 shadow 日更跑起来才长出来（**尚未挂 cron**）。
+
+**重叠期 rank correlation（契约 §4 的验收项）**
+
+| 比较 | 天数 | 名数 | mean ρ | min ρ | 判据 0.8 |
+|---|---|---|---|---|---|
+| live 分 vs backfill（同日 20261014） | 1 | 300 | **0.8702** | 0.8702 | 过，但 **n=1 只是冒烟** |
+| purge=0（= live 配方）vs purge=60，逐调仓日 | 13 | 300 | 0.8473 | **0.2255** | **不过**（2/13 天 ρ<0.4） |
+
+第二行是本次新增的诊断，把 §7「Backfill 与 Shadow 分布不一致」那条风险量化了：**训练窗差 60 天，排名就会被重排**，个别日子（20251029 ρ=0.23、20250923 ρ=0.36）几乎没什么共同意见。
+
+**purge 敏感性 —— 本节最该看的东西**
+
+B0 冻结的 `purge ≥ 60` 直到 B3b 才真的落在 backfill 上（此前只退了 `horizon+1 = 21` 天）。补上之后，同一块面板、同一个模型：
+
+| 训练窗末距 T | flag | B 每期 | t | B−A（年化） | 组合重叠 |
+|---|---|---|---|---|---|
+| 21 交易日（**旧行为** = live 配方） | `--backfill-purge 0` | +3.0007% | 0.763 | **−10.03pp** | 72.7% |
+| 42 交易日 | `--backfill-purge 21` | +3.6420% | 0.928 | +0.23pp | 65.4% |
+| 81 交易日（**契约主口径**） | `--backfill-purge 60`（默认） | +4.2153% | 1.155 | **+12.11pp** | 53.8% |
+
+A 轨三次**逐位相同**（+3.5532%/期，t=0.9358，gross t=0.9586）⇒ 面板、记账、调仓网格都没动，**差异全部来自禁运期**。`--backfill-purge 0` 精确复现了 B2 那跑的 B（+3.0007%/t=0.763/−10.03pp），证明这次重构本身不改行为。
+
+**结论（须随之一起引用）**：在这 12 期样本上，「B 打不打得过 A」**不由数据决定，而由禁运期决定** —— −10pp 到 +12pp 全都能取到，且三条的 t 都 ≤ 1.16。这不支持任何方向的结论；它说明在动 N / 窗口这些旋钮之前，purge 先得讲清楚。**B 轨目前只能算「管道通了」，不能算「有效」。**
+
 ---
 
 ## 6. 测试策略
 
 | 层级 | 内容 |
 |------|------|
-| 单元 | 调仓日历；单日 TOP-N；缺失截面语义；末段完整期判定；purge 断言（训练窗末 ≤ T − 80 交易日，horizon 20 + purge 60） |
-| 集成 | 合成小面板跑通 A/B/R 三轨；`--bundle` 离线夹具 |
-| 对账 | A 轨与 `ScoreBacktester` 同参数逐日一致（B2） |
+| 单元 | 调仓日历；单日 TOP-N；缺失截面语义；末段完整期判定；**purge 断言**（✅ B3b：`test_default_purge_is_the_protocol_embargo` 钉住训练窗末 = T − horizon − purge，另有 `purge=0` = live 配方的对照）；重叠期 rank correlation（同序=1、反序=失败、名数不足不硬算） |
+| 集成 | 合成小面板跑通 A/B/R 三轨；`--bundle` 离线夹具；`model_predictions` 读取按 `model_id`/`shadow` 过滤（假集合） |
+| 对账 | A 轨与 `ScoreBacktester` 同参数逐日一致（B2）；B 轨 live 分 vs backfill rank correlation（B3b，§5.2） |
 | **harness 自证** | **对照轨 R 相对池等权超额 ≈ 0**；可选泄漏探针（把 T 日分数换成 T+1 日分数，harness 应显著变好） |
 | 手工 | aipoc 跑全窗口，`summary.json` 人工 spot-check 3 个调仓日持仓 |
 
@@ -234,7 +267,8 @@ demo 侧**不复用**平台这段代码（`demo/sources.py` 自带 as-of 因子 
 |------|------|
 | 12 期/年的净值差被当结论 | 报告以主指标打头；净值旁强制标注期数与功效 |
 | **边界同分**：A 轨是 2 位小数合成分，第 N/N+1 名撞分时换谁进组合可让单期 gross 摆动 ~1.5pp（实测 12 期里 2 期） | demo 的 tie-break 写死「同分按 symbol 升序」并随每组分数一起可复现；对照口径的差异已在 §5.1 量化。**解读单期净值时必须先看该期有没有撞分** —— 撞分期的净值差不构成证据 |
-| Backfill 与 Shadow 分布不一致 | 重叠期 rank correlation 校验；不达标则长曲线只作管道验证 |
+| **B 轨结论随禁运期翻转**（2026-10-15 实测）：同一面板同一模型，`purge=0/21/60` 对应 B−A = **−10.03 / +0.23 / +12.11pp** 每年，三条 t ≤ 1.16 | 报告 B 时必须同时给三档敏感性（§5.2）；**不准单独引用任一档当结论**。契约主口径仍是 purge=60，因为它是冻结值，不是因为它是最好看的那个 |
+| Backfill 与 Shadow 分布不一致 | ✅ B3b 已量化：live vs backfill ρ=0.8702（n=1）；purge=0 vs 60 逐日 mean 0.8473 / min 0.2255 ⇒ 长曲线只作管道验证 |
 | 成本口径分歧（4 套并存） | §1.2 写死采用「费用 + 单边滑点」，并在 summary 里回显常量 |
 | 本机从未训练过（`quant_ml` 空），B 轨无现成分可用 | B3a 先跑通本机闭环；A 轨与 harness（R 轨）不依赖 B 轨，可并行落地 |
 | 本机 PIT backfill 计算量（每调仓日一次 refit） | 先实测单次 refit 耗时再定窗口深度；必要时降频或复用物化面板截断 |
@@ -249,17 +283,24 @@ demo 侧**不复用**平台这段代码（`demo/sources.py` 自带 as-of 因子 
 **已实现（B1/B2）** —— 三条路径：离线 `--bundle` / `--dates-file`（零 Mongo 依赖）、`--from-mongo`（本机直连）：
 
 ```bash
-# 本机真实数据（B2）
+# 本机真实数据（B2/B3b）—— 推荐：B 轨配方与面板都从 quant_ml 的 job 解析
 python -m quant_model_platform.tools.demo_hs300_20d_top20 --from-mongo \
   --index-code hs300 --start-date 20241001 --end-date 20261014 --years 1 \
   --top-n 20 --rebalance-days 20 \
   --score-column ""            # 空 = A 轨自算 60:40；命名则读 stock_scores 该列
-  --model-snapshot /data/quant_ml/parquet/snapshots/hs300_production_20241001_20261014.parquet \
-  --model-kind ridge           # B 轨：有 shadow 行用 shadow 行，否则按 PIT refit
-  --shadow-live-from ""        # 非空则从该日起只认已存 shadow 分
+  --source-job-id b7618410-…   # B 轨：从 model_training_jobs 读配方 + 规范快照
+  --shadow-live-from 20261014  # 该日及以后只认 model_predictions，缺分报错
+  --backfill-purge 60          # 协议禁运期；默认 60，降档只为做敏感性
+  --check-overlap              # 额外输出 live/purge 的 rank correlation（多几次 refit）
   --control-seed 20261015      # R 轨可换种子复核，不必设开关：R 恒开
   --out-dir /tmp/demo-hs300
+
+# 离线替代：不给 --source-job-id 时，用 --model-snapshot <parquet> + --model-kind 顶替
 ```
+
+**Shadow 侧（本机）**：先 `materialize_snapshot --canonical --register-mongo`（规范快照是
+`model_shadow_profiles` 的前置），再 `register_shadow_profile --profile-id … --source-job-id …`，
+然后 `python -m quant_model_platform.workers.shadow_loop --once`。**日更 cron 尚未挂**。
 
 - `--start-date/--end-date` 是**取数范围**；窗口是其中**最后 `--years` 个交易日**（不足则报错退出 2）。
 - `--mongo-uri/--mongo-db/--data-db` 可覆盖环境变量；`summary.source` 记的是**生效库名**，不是 flag。
@@ -274,9 +315,14 @@ python -m quant_model_platform.tools.demo_hs300_20d_top20 --from-mongo \
 
 ## 9. 待拍板
 
+- [ ] **B 轨口径（B3b 新出，优先级最高）**：backfill 用 `purge=60`（契约冻结值）还是 `purge=0`（= 实盘 shadow 的 refit 方式）？
+  - 现状：`--backfill-purge` 默认 **60**（照契约）。但两条路给出的 B−A 是 **−10.03pp 与 +12.11pp/年**（§5.2），而**实盘 shadow 走的是 purge=0 那条**。
+  - 这不是调参问题，是「B 轨到底在测谁」的定位问题：测「协议下的模型」还是「实盘会拿到的模型」。**请拍板，不拍板就保持 60 不动。**
 - [ ] 主口径 **N=10 / 调仓 20d** 是否认可（原稿为 TOP20 / 20d；实盘是 TOP10 / 30d）
   - 现状：CLI 默认仍是 **N=20 / 20d**（与文件名、标题、原稿一致）；主口径差一个 `--top-n 10`。**是否把默认改成 N=10 请拍板** —— 不拍板就保持默认不动的原则。
 - [x] ~~`demo_id` 是否改名~~ → 改为**按参数派生**：`demo-{index}-{rebalance}d-top{n}-{years}y`（如 `demo-hs300-20d-top20-1y`），任何一次跑都自描述，不再是写死的名字。
 - [x] ~~B 轨读数通道~~ → **本机自产**（K8s 不可访问；见 §1.1 / §3.1）
-- [ ] 窗口：默认 2 年（快速迭代）还是拉长（score 数据 2015-01 起、价量 2010 起都够）；受 PIT backfill 成本约束，建议先实测单次 refit 耗时
+- [ ] 窗口：默认 2 年（快速迭代）还是拉长（score 数据 2015-01 起、价量 2010 起都够）
+  - ✅ 成本已实测：13 个调仓日 + overlap 检查（~25 次 refit）端到端 **10s** ⇒ backfill 成本**不是**窗口深度的约束；约束改成了「越长的窗口越该先看清 purge 敏感性」（§5.2）
 - [ ] B3a 物化范围：只物化 hs300，还是顺带 a500/csi1000（B4 池参数化要用）
+- [ ] 本机 shadow **日更 cron** 要不要挂（不挂 ⇒ live 段永远是 1 天；挂 ⇒ 8–12 周后才有可用的 live 观察段）

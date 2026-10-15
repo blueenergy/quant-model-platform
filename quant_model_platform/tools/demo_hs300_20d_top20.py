@@ -7,6 +7,12 @@ summary.json (see docs/DEMO_HS300_20D_TOP20.md).
 ``--from-mongo`` builds the same payload from this machine's own Mongo
 (``stock_scores`` membership as of each day, hfq opens, forward returns), so
 the demo needs no hand-assembled fixture and no remote artifact.
+
+Track B comes from the same local ``quant_ml`` the shadow loop writes to:
+``--source-job-id`` pulls that job's recipe (model kind, features, params) and
+its canonical Parquet snapshot, and stored ``model_predictions`` are used as-is
+on/after ``--shadow-live-from``. ``--check-overlap`` measures whether the PIT
+backfill ranks a day the way the live recipe does.
 """
 
 from __future__ import annotations
@@ -22,7 +28,9 @@ import pandas as pd
 from pymongo import MongoClient
 
 from quant_model_platform.config import PlatformConfig
+from quant_model_platform.db import get_ml_collections
 from quant_model_platform.demo import sources
+from quant_model_platform.demo.backfill_pit import predict_cross_section_as_of
 from quant_model_platform.demo.calendar import rebalance_signal_dates, window_trading_days
 from quant_model_platform.demo.portfolio import (
     CONTROL_SEED,
@@ -31,7 +39,15 @@ from quant_model_platform.demo.portfolio import (
     SELF_COMPUTED_SCORE,
     compare_tracks,
 )
-from quant_model_platform.demo.track_b import resolve_model_scores
+from quant_model_platform.demo.track_b import (
+    cross_section_rank_correlation,
+    load_shadow_predictions,
+    resolve_model_scores,
+    scores_by_day,
+)
+from quant_model_platform.protocol import MAX_PURGE_DAYS
+from quant_model_platform.shadow.resolve import merge_job_into_shadow_params
+from quant_model_platform.training.panel_loader import load_training_panel
 
 
 def _read_dates(path: Path) -> list[str]:
@@ -97,7 +113,7 @@ def _cost_block() -> Dict[str, Any]:
     }
 
 
-def _caveats(*, top_n: int, rebalance_days: int) -> List[str]:
+def _caveats(*, top_n: int, rebalance_days: int, backfill_purge: int) -> List[str]:
     return [
         "gross return is the equal-weight mean of forward_return over the hold window (next open to next open)",
         f"net return pays {ROUND_TRIP_COST_RATE * 10_000:.1f} bps per 100% turnover; the opening book pays one side, later swaps both",
@@ -106,6 +122,7 @@ def _caveats(*, top_n: int, rebalance_days: int) -> List[str]:
         "drawdown and the equity curve are on the rebalance grid, not daily",
         f"one year holds about 252/{rebalance_days} ~= {252 // rebalance_days} independent periods: the NAV cannot support a 'better' claim, only the per-day metrics can",
         f"top_n={top_n} and rebalance_days={rebalance_days} are the run's parameters; the frozen contract's primary/ sensitivity pair is still open (section 9)",
+        f"track B's backfill trains with a {backfill_purge}-day embargo; the live scorer uses none, and the ranking moves with that choice (see model_overlap)",
     ]
 
 
@@ -126,9 +143,6 @@ def _source_block(
             "index_code": args.index_code,
             "coverage_start": args.start_date,
             "coverage_end": args.end_date,
-            "model_snapshot": str(args.model_snapshot) if args.model_snapshot else None,
-            "model_kind": args.model_kind if args.model_snapshot else None,
-            "shadow_live_from": args.shadow_live_from or None,
         }
     return {"kind": "bundle", "bundle": str(args.bundle) if args.bundle else None}
 
@@ -163,10 +177,13 @@ def _emit_report(
         "years": args.years,
         "top_n": args.top_n,
         "rebalance_days": args.rebalance_days,
+        "backfill_purge_days": args.backfill_purge,
         "score_column": report["track_a"]["score_column"],
         "model_id": args.model_id,
         "source_job_id": args.source_job_id,
         "source": source or _source_block(args),
+        "model_source": payload.get("model_source"),
+        "model_overlap": payload.get("model_overlap"),
         "cost": _cost_block(),
         "window_start": window[0] if window else None,
         "window_end": window[-1] if window else None,
@@ -178,7 +195,9 @@ def _emit_report(
         "track_r": report["track_r"],
         "control_r": report["control_r"],
         "comparison": report["comparison"],
-        "caveats": _caveats(top_n=args.top_n, rebalance_days=args.rebalance_days),
+        "caveats": _caveats(
+            top_n=args.top_n, rebalance_days=args.rebalance_days, backfill_purge=args.backfill_purge
+        ),
     }
     text = json.dumps(summary, indent=2)
     if args.out_dir:
@@ -197,22 +216,124 @@ def _run_bundle(args: argparse.Namespace) -> int:
     return _emit_report(args, payload, index_code=args.index_code)
 
 
-def _model_scores(args: argparse.Namespace, signals: Sequence[str]) -> Dict[str, List[Dict[str, Any]]]:
-    """Track B from a local snapshot: shadow rows when they exist, PIT refit otherwise."""
-    if not args.model_snapshot:
+def _model_context(args: argparse.Namespace, cfg: PlatformConfig, *, index_code: str) -> Optional[Dict[str, Any]]:
+    """Track B's panel, recipe and stored predictions, all from the local ``quant_ml``.
+
+    With ``--source-job-id`` the recipe and the canonical snapshot come out of the
+    same resolver the shadow loop uses, so the demo cannot drift from the live
+    scorer through hand-copied parameters (docs section 1, section 4).
+    """
+    if not args.source_job_id and not args.model_snapshot:
+        return None
+    collections = get_ml_collections(config=cfg)
+    provenance: Dict[str, Any] = {"kind": "job" if args.source_job_id else "snapshot"}
+    if args.source_job_id:
+        merged = merge_job_into_shadow_params({"source_job_id": args.source_job_id}, collections)
+        job_index = str(merged.get("index_code") or "")
+        if job_index and job_index != index_code:
+            raise ValueError(f"job index_code={job_index} but --index-code={index_code}")
+        panel, snapshot_id, panel_path = load_training_panel(
+            merged, parquet_root=Path(cfg.parquet_root), config=cfg
+        )
+        params = merged
+        provenance.update(
+            {"source_job_id": args.source_job_id, "snapshot_id": snapshot_id, "parquet_path": panel_path}
+        )
+    else:
+        panel = pd.read_parquet(args.model_snapshot)
+        params = {"model_kind": args.model_kind}
+        provenance.update({"snapshot_id": None, "parquet_path": str(args.model_snapshot)})
+    params.setdefault("model_kind", args.model_kind)
+    model_id = args.model_id or str(params.get("model_id") or "")
+    live = load_shadow_predictions(
+        collections,
+        model_id=model_id,
+        index_code=index_code,
+        start=args.start_date or "",
+        end=args.end_date or "",
+    )
+    provenance.update(
+        {
+            "model_id": model_id,
+            "model_kind": params.get("model_kind"),
+            "live_rows": len(live),
+            "live_dates": sorted(scores_by_day(live)),
+            "shadow_live_from": args.shadow_live_from or None,
+        }
+    )
+    return {"panel": panel, "params": params, "live_rows": live, "provenance": provenance}
+
+
+def _model_scores(
+    args: argparse.Namespace, signals: Sequence[str], context: Optional[Dict[str, Any]]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Track B per signal day: live rows on/after the boundary, PIT refit before."""
+    if not context:
         return {}
-    panel = pd.read_parquet(args.model_snapshot)
-    params = {"model_kind": args.model_kind}
     out: Dict[str, List[Dict[str, Any]]] = {}
     for day in signals:
         out[str(day)[:8]] = resolve_model_scores(
-            [],
-            panel,
-            params,
+            context["live_rows"],
+            context["panel"],
+            context["params"],
             day,
             shadow_live_from=args.shadow_live_from,
+            purge=args.backfill_purge,
         )
     return out
+
+
+def _backfill_rows(
+    day: str, context: Dict[str, Any], *, purge: int, already: Sequence[Dict[str, Any]] = ()
+) -> List[Dict[str, Any]]:
+    """Protocol backfill for one day, reusing already-scored rows when possible."""
+    rows = [row for row in already if str(row.get("score_source") or "") == "backfill_pit"]
+    if rows:
+        return rows
+    frame = predict_cross_section_as_of(context["panel"], context["params"], day, purge=purge)
+    return frame.to_dict(orient="records")
+
+
+def _overlap_report(
+    context: Dict[str, Any],
+    signals: Sequence[str],
+    scores_b: Dict[str, List[Dict[str, Any]]],
+    *,
+    purge: int = MAX_PURGE_DAYS,
+) -> Dict[str, Any]:
+    """Does the backfill rank the way the live recipe does?
+
+    Two comparisons, both rank-based because the training windows differ and so
+    the score levels do:
+
+    * ``live_vs_backfill`` -- stored shadow rows against the protocol backfill on
+      the days both cover. This is the contract's acceptance check (section 4).
+    * ``purge_effect`` -- the protocol backfill against the same refit with the
+      embargo removed, on every signal day. The live scorer refits on all labelled
+      rows, so this isolates how much of the gap is the embargo itself.
+    """
+    report: Dict[str, Any] = {
+        "purge_days": purge,
+        "live_vs_backfill": None,
+        "purge_effect": None,
+        "note": "rank correlation, per shared day; threshold in demo/track_b.py",
+    }
+    live = context["live_rows"]
+    live_days = sorted(scores_by_day(live))
+    if live_days:
+        backfill = []
+        for day in live_days:
+            backfill.extend(_backfill_rows(day, context, purge=purge, already=scores_b.get(day, ())))
+        report["live_vs_backfill"] = cross_section_rank_correlation(live, backfill)
+    unpurged, purged = [], []
+    for day in signals:
+        key = str(day)[:8]
+        unpurged.extend(
+            predict_cross_section_as_of(context["panel"], context["params"], key, purge=0).to_dict("records")
+        )
+        purged.extend(_backfill_rows(key, context, purge=purge, already=scores_b.get(key, ())))
+    report["purge_effect"] = cross_section_rank_correlation(unpurged, purged)
+    return report
 
 
 def _run_mongo(args: argparse.Namespace) -> int:
@@ -240,6 +361,11 @@ def _run_mongo(args: argparse.Namespace) -> int:
         if window is None:
             return 2
         signals = rebalance_signal_dates(window, interval=args.rebalance_days)
+        try:
+            context = _model_context(args, cfg, index_code=args.index_code)
+        except (ValueError, RuntimeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         payload = sources.build_bundle(
             client,
             docs=docs,
@@ -250,8 +376,14 @@ def _run_mongo(args: argparse.Namespace) -> int:
             horizon=args.rebalance_days,
             score_column=args.score_column,
         )
-        payload["scores_b"] = _model_scores(args, signals)
+        payload["scores_b"] = _model_scores(args, signals, context)
         payload["trading_days"] = days
+        if context:
+            payload["model_source"] = context["provenance"]
+            if args.check_overlap:
+                payload["model_overlap"] = _overlap_report(
+                    context, signals, payload["scores_b"], purge=args.backfill_purge
+                )
     finally:
         client.close()
     return _emit_report(
@@ -303,7 +435,11 @@ def main(argv=None) -> int:
         help=f"stock_scores column to score track A by; empty = self-computed blend ({SELF_COMPUTED_SCORE})",
     )
     parser.add_argument("--model-id", default="", help="label for track B's model; empty = unspecified")
-    parser.add_argument("--source-job-id", default="", help="training job behind track B; empty = unspecified")
+    parser.add_argument(
+        "--source-job-id",
+        default="",
+        help="quant_ml training job behind track B: supplies its recipe and canonical snapshot",
+    )
     parser.add_argument("--control-seed", type=int, default=CONTROL_SEED, help="track R seed; rerun with another to check R is not a fluke")
     parser.add_argument("--dates-file", type=Path, help="YYYYMMDD per line (calendar only)")
     parser.add_argument("--bundle", type=Path, help="JSON with trading_days, scores_a, scores_b, forward_returns")
@@ -314,9 +450,21 @@ def main(argv=None) -> int:
     parser.add_argument("--data-db", help="price DB; default DATA_DB_NAME")
     parser.add_argument("--start-date", help="coverage start YYYYMMDD (--from-mongo)")
     parser.add_argument("--end-date", help="coverage end YYYYMMDD (--from-mongo)")
-    parser.add_argument("--model-snapshot", type=Path, help="local panel parquet that track B refits from")
-    parser.add_argument("--model-kind", default="ridge", help="model fitted by the track B backfill")
+    parser.add_argument("--model-snapshot", type=Path, help="panel parquet to refit from when no --source-job-id")
+    parser.add_argument("--model-kind", default="ridge", help="model kind used with --model-snapshot")
     parser.add_argument("--shadow-live-from", default="", help="stored shadow scores replace the backfill from this date")
+    parser.add_argument(
+        "--check-overlap",
+        action="store_true",
+        help="report how well the backfill reproduces the live recipe (extra refits)",
+    )
+    parser.add_argument(
+        "--backfill-purge",
+        type=int,
+        default=MAX_PURGE_DAYS,
+        help=f"embargo days between the backfill's training window and the signal day; "
+        f"the contract freezes {MAX_PURGE_DAYS}, lower it only to measure sensitivity",
+    )
     parser.add_argument("--out-dir", type=Path)
     args = parser.parse_args(argv)
 
