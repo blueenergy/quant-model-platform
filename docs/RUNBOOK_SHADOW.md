@@ -1,5 +1,7 @@
 # Shadow 旁路运维（Phase 1 / 1.5）
 
+与成长+周期策略对比的 1 年 demo 规格见 [DEMO_HS300_20D_TOP20.md](DEMO_HS300_20D_TOP20.md)。
+
 Shadow 写入 `quant_ml.model_predictions`（`shadow: true`），**不**写 `stock_scores`。
 
 ## 观察期启动条件（Phase 1.5）
