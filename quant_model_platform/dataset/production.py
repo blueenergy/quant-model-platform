@@ -26,6 +26,8 @@ _SCORE_FIELD_MAP = {
 }
 
 _PRICE_PROJECTION = {"_id": 0, "symbol": 1, "trade_date": 1, "open": 1}
+_ADJ_FACTOR_COLLECTION = "stock_adj_factor"
+_ADJ_FACTOR_PROJECTION = {"_id": 0, "symbol": 1, "trade_date": 1, "adj_factor": 1}
 _SYMBOL_CHUNK = 250
 
 
@@ -39,6 +41,11 @@ def _normalize_trade_date(value: Any) -> Optional[str]:
 def _extend_end_calendar(end_date: str, extra_days: int = 45) -> str:
     dt = datetime.strptime(end_date, "%Y%m%d")
     return (dt + timedelta(days=extra_days)).strftime("%Y%m%d")
+
+
+def _extend_start_calendar(start_date: str, extra_days: int = 45) -> str:
+    dt = datetime.strptime(start_date, "%Y%m%d")
+    return (dt - timedelta(days=extra_days)).strftime("%Y%m%d")
 
 
 def _flatten_score_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -114,6 +121,99 @@ def load_stock_score_rows(
     return [r for r in rows if r]
 
 
+def _load_adj_factors(
+    client: MongoClient,
+    *,
+    data_db_name: str,
+    symbols: Sequence[str],
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """Adjustment factors keyed by (trade_date, ts_code) for a price window.
+
+    Callers should pass a ``start_date`` earlier than the price window so the
+    forward fill below always has a seed for each symbol's first row.
+    """
+    coll = client[data_db_name][_ADJ_FACTOR_COLLECTION]
+    unique = sorted({s for s in symbols if s})
+    chunks: List[pd.DataFrame] = []
+    for i in range(0, len(unique), _SYMBOL_CHUNK):
+        batch = unique[i : i + _SYMBOL_CHUNK]
+        query = {"symbol": {"$in": batch}, "trade_date": {"$gte": start_date, "$lte": end_date}}
+        part = pd.DataFrame(list(coll.find(query, _ADJ_FACTOR_PROJECTION)))
+        if not part.empty:
+            chunks.append(part)
+    if not chunks:
+        return pd.DataFrame(columns=["trade_date", "ts_code", "adj_factor"])
+    frame = pd.concat(chunks, ignore_index=True)
+    frame["trade_date"] = frame["trade_date"].map(_normalize_trade_date)
+    frame["ts_code"] = frame["symbol"].astype(str)
+    frame["adj_factor"] = pd.to_numeric(frame["adj_factor"], errors="coerce")
+    frame = frame.dropna(subset=["trade_date", "ts_code", "adj_factor"])
+    # A duplicated key would fan the price join out and double-count rows.
+    return frame.drop_duplicates(subset=["trade_date", "ts_code"], keep="last")[
+        ["trade_date", "ts_code", "adj_factor"]
+    ]
+
+
+def _resolve_adj_factors(price_keys: pd.DataFrame, factors: pd.DataFrame) -> pd.Series:
+    """Most recent factor at or before each price date, per symbol.
+
+    Factor rows are interleaved with the price keys before the fill, so a factor
+    from before the window seeds each symbol's first rows, and a date the factor
+    feed skipped inherits the last known level instead of going NaN.
+    """
+    seeded = pd.concat(
+        [
+            factors[["ts_code", "trade_date", "adj_factor"]],
+            price_keys[["ts_code", "trade_date"]],
+        ],
+        ignore_index=True,
+    ).sort_values(["ts_code", "trade_date"], kind="mergesort")
+    seeded["adj_factor"] = seeded.groupby("ts_code", sort=False)["adj_factor"].ffill()
+    filled = seeded.dropna(subset=["adj_factor"]).drop_duplicates(
+        subset=["trade_date", "ts_code"], keep="last"
+    )
+    return price_keys.merge(filled, on=["trade_date", "ts_code"], how="left")["adj_factor"].to_numpy()
+
+
+def _apply_adj_factor(
+    client: MongoClient,
+    frame: pd.DataFrame,
+    *,
+    data_db_name: str,
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """Multiply opens by the forward-adjustment factor.
+
+    ``volume_price.open`` is the raw traded price, so a split or a dividend
+    inside a forward window reads as a huge fake return. Every label and
+    backtest here is a ratio of two opens, so any single multiplicative basis
+    gives the same return; hfq (``open * adj_factor``) matches what
+    ``ScoreBacktester`` uses via ``adjust="hfq"``.
+    """
+    factors = _load_adj_factors(
+        client,
+        data_db_name=data_db_name,
+        symbols=frame["ts_code"].unique().tolist(),
+        start_date=_extend_start_calendar(start_date),
+        end_date=end_date,
+    )
+    out = frame.copy()
+    out["adj_factor"] = _resolve_adj_factors(out[["ts_code", "trade_date"]], factors)
+    missing = out["adj_factor"].isna()
+    if missing.any():
+        log.warning(
+            "no adj_factor for %d/%d price rows (%.3f%%); those opens stay unadjusted",
+            int(missing.sum()),
+            len(out),
+            100.0 * float(missing.mean()),
+        )
+    out["open"] = out["open"] * out["adj_factor"].fillna(1.0)
+    return out.drop(columns=["adj_factor"])
+
+
 def load_open_prices(
     client: MongoClient,
     *,
@@ -122,6 +222,7 @@ def load_open_prices(
     start_date: str,
     end_date: str,
 ) -> pd.DataFrame:
+    """Forward-adjusted opens, one row per (trade_date, ts_code)."""
     start = _normalize_trade_date(start_date)
     end = _extend_end_calendar(_normalize_trade_date(end_date) or end_date)
     if not start or not end:
@@ -141,7 +242,11 @@ def load_open_prices(
     frame["trade_date"] = frame["trade_date"].map(_normalize_trade_date)
     frame["ts_code"] = frame["symbol"].astype(str)
     frame["open"] = pd.to_numeric(frame["open"], errors="coerce")
-    return frame.dropna(subset=["trade_date", "ts_code", "open"])[["trade_date", "ts_code", "open"]]
+    frame = frame.dropna(subset=["trade_date", "ts_code", "open"])
+    frame = _apply_adj_factor(
+        client, frame, data_db_name=data_db_name, start_date=start, end_date=end
+    )
+    return frame[["trade_date", "ts_code", "open"]]
 
 
 def build_production_panel(
