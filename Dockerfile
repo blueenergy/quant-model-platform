@@ -12,12 +12,20 @@ RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debia
 
 WORKDIR /app
 
+# Dependencies in their own layer, keyed on pyproject.toml alone. The ACR relay
+# pulls this image cross-border at 50 KB/s - 6 MB/s; while the install shared a
+# layer with the source, every commit changed that layer's digest and re-sent
+# all 185 MB of it. Keep this RUN above the source COPY -- merging the two back
+# together costs 185 MB per commit.
 COPY pyproject.toml README.md ./
-COPY quant_model_platform ./quant_model_platform
-
 RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
     pip config set global.extra-index-url https://pypi.org/simple && \
-    pip install --no-cache-dir .
+    python -c 'import tomllib;print(chr(10).join(tomllib.load(open("pyproject.toml","rb"))["project"]["dependencies"]))' > /tmp/deps.txt && \
+    pip install --no-cache-dir -r /tmp/deps.txt && \
+    rm /tmp/deps.txt
+
+COPY quant_model_platform ./quant_model_platform
+RUN pip install --no-cache-dir --no-deps .
 
 RUN groupadd -g 1000 appgroup && \
     useradd -u 1000 -g appgroup -m appuser && \
