@@ -28,6 +28,7 @@ bars; :func:`forward_return` refuses them on purpose.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -156,11 +157,30 @@ def _find_exit_index(rows: Sequence[Dict[str, Any]], target_idx: int) -> Optiona
     return None
 
 
-def forward_return(rows: Sequence[Dict[str, Any]], signal_date: str, horizon: int) -> Optional[float]:
-    """Next-open entry, ``horizon``-session exit; None when the rule refuses the trade."""
+def holding_path(
+    rows: Sequence[Dict[str, Any]],
+    signal_date: str,
+    horizon: int,
+    *,
+    dates: Optional[Sequence[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Where one symbol's holding period starts, ends and at what prices.
+
+    The single implementation of the entry/exit rules; :func:`forward_return` is
+    its scalar view. The daily NAV needs the same entry bar, the same limit-up
+    refusal and the same delayed exit, so it reads them from here instead of
+    re-deriving them -- a second copy would drift from this one silently.
+
+    ``rows`` must be in ascending ``trade_date`` order (``clean_price_rows``
+    guarantees it, and the exit-delay rule already reads ``rows[idx - 1]`` as
+    the previous session). ``dates`` is that ordering precomputed; a caller
+    asking about many signal dates over one symbol passes it to skip re-scanning
+    the history every time.
+    """
     day = str(signal_date)[:8]
-    entry_idx = next((i for i, row in enumerate(rows) if row["trade_date"] > day), None)
-    if entry_idx is None:
+    stamps = dates if dates is not None else [row["trade_date"] for row in rows]
+    entry_idx = bisect_right(stamps, day)
+    if entry_idx >= len(rows):
         return None
     previous = rows[entry_idx - 1] if entry_idx > 0 else None
     if _one_price_limit(rows[entry_idx], previous, up=True):
@@ -177,7 +197,19 @@ def forward_return(rows: Sequence[Dict[str, Any]], signal_date: str, horizon: in
     exit_price = _execution_price(rows[exit_idx])
     if exit_price is None or exit_price <= 0:
         return None
-    return exit_price / entry_price - 1.0
+    return {
+        "entry_index": entry_idx,
+        "exit_index": exit_idx,
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "return": exit_price / entry_price - 1.0,
+    }
+
+
+def forward_return(rows: Sequence[Dict[str, Any]], signal_date: str, horizon: int) -> Optional[float]:
+    """Next-open entry, ``horizon``-session exit; None when the rule refuses the trade."""
+    path = holding_path(rows, signal_date, horizon)
+    return None if path is None else path["return"]
 
 
 def forward_returns_by_signal_date(

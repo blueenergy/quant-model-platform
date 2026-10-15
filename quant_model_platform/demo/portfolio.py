@@ -7,9 +7,15 @@ live here.
 
 Costs follow the frozen contract (docs/DEMO_HS300_20D_TOP20.md section 1.2):
 7 bps of fees round trip plus 10 bps of slippage a side, i.e. 13.5 bps a side
-and 27 bps to swap a fully changed book. Drawdown is measured on the rebalance
-grid, not daily, and the period count is a year's worth at best -- treat the
-NAV as communication, never as evidence.
+and 27 bps to swap a fully changed book.
+
+Two drawdowns come out of here and they are not the same number. The one on the
+track blocks is taken on the rebalance grid -- about thirteen points a year, so
+it steps over every trough inside a holding period. The daily one lives in
+``daily.tracks`` and is the one to read: it marks the same books every session
+(``demo/daily.py``), and it reconciles with these period rows exactly. The grid
+number is kept because it is what earlier batches reported, not because it is
+the better measurement.
 """
 
 from __future__ import annotations
@@ -18,8 +24,10 @@ import math
 from statistics import pstdev
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from quant_model_platform.demo.daily import daily_block
 from quant_model_platform.demo.primary import (
     daily_metrics,
+    pool_return,
     pool_symbols_by_date,
     quantile_rows,
     summarize_primary,
@@ -167,6 +175,36 @@ def overlap_ratio(left: Sequence[str], right: Sequence[str]) -> Optional[float]:
     return len(set(left) & set(right)) / max(len(left), len(right))
 
 
+def _pool_rows(
+    track_rows: Sequence[Mapping[str, Any]],
+    pool_symbols: Mapping[str, Sequence[str]],
+    forward_returns: Mapping[str, Mapping[str, float]],
+) -> List[Dict[str, Any]]:
+    """The benchmark written as a book, so the daily engine can hold it too.
+
+    Its holdings are the day's own cross-section and its period return comes
+    from ``primary.pool_return`` -- called, not re-derived, so a benchmark that
+    drifted from the excess would have to drift in exactly one place. It pays no
+    cost: it is a level, not a strategy.
+    """
+    rows: List[Dict[str, Any]] = []
+    for row in track_rows:
+        day = row["trade_date"]
+        holdings = list(pool_symbols.get(day) or [])
+        gross, _ = pool_return(holdings, forward_returns.get(day) or {})
+        rows.append(
+            {
+                "trade_date": day,
+                "holdings": holdings,
+                "cross_section": row["cross_section"],
+                "cost": 0.0,
+                "gross_return": gross,
+                "net_return": gross,
+            }
+        )
+    return rows
+
+
 def compare_tracks(
     signal_dates: Sequence[str],
     scores_a: Mapping[str, Sequence[Dict[str, Any]]],
@@ -179,6 +217,7 @@ def compare_tracks(
     control_seed: int = CONTROL_SEED,
     trading_days: Sequence[str] = (),
     horizon_declared_by: str = "rebalance_days",
+    prices: Optional[Mapping[str, Sequence[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     """Track A (rules), track B (model) and track R (random control).
 
@@ -189,8 +228,15 @@ def compare_tracks(
     R's scores are drawn here and handed to both the equity engine and the
     primary-evidence block, so there is exactly one definition of the control
     track and it cannot drift between the two. ``trading_days`` is the window
-    calendar, used only to measure whether the signal grid's return windows
-    actually do avoid each other.
+    calendar, used to measure whether the signal grid's return windows actually
+    do avoid each other and to bound the daily grid.
+
+    ``prices`` is the same per-symbol history the forward returns were built
+    from; with it the daily NAV is marked session by session, without it the
+    daily block is ``None`` and only the grid-level numbers exist. The pool runs
+    through that engine as a fourth book -- its period rows are the day's
+    cross-section priced the same way ``primary.pool_return`` prices it -- so
+    the benchmark is not a second code path that can drift from the excess.
     """
     track_a = simulate_track(signal_dates, scores_a, forward_returns, top_n=top_n, track="baseline")
     track_b = simulate_track(signal_dates, scores_b, forward_returns, top_n=top_n, track="model")
@@ -230,6 +276,19 @@ def compare_tracks(
         horizon_declared_by=horizon_declared_by,
         quantile_rows=quantiles_by_date,
     )
+    daily = daily_block(
+        {
+            "baseline": track_a,
+            "model": track_b,
+            "control_random": track_r,
+            "pool": _pool_rows(track_a, pool_symbols, forward_returns),
+        },
+        prices or {},
+        forward_returns,
+        horizon=hold_days,
+        trading_days=trading_days,
+        relative_to="pool",
+    )
     return {
         "track_a": {**public_a, "score_column": score_column_a or SELF_COMPUTED_SCORE},
         "track_b": public_b,
@@ -244,6 +303,8 @@ def compare_tracks(
         "metrics_by_date": metrics_by_date,
         "quantiles_by_date": quantiles_by_date,
         "primary": primary,
+        "daily": (daily or {}).get("summary"),
+        "daily_nav": (daily or {}).get("rows") or [],
         "equity_curve": [
             {
                 "trade_date": day,

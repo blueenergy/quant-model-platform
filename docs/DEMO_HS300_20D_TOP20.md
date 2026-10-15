@@ -2,6 +2,7 @@
 
 **长期 ML 计划的评估基准**：在 hs300 上，模型分是否**稳定优于**生产的成长+周期加权规则分。  
 主证据是扣成本后的**中性化 IC / top-K 逐日超额**；净值与回撤只作沟通，**不作为结论依据**。  
+回撤**已改为按日频逐日打点**（N3，§5.10）：它现在是**测出来的**、不再被 20 日持仓期跨过去，但它「独立事件太少」的毛病没有变，所以**仍不是结论**。  
 **只读生产数据；不写 `stock_scores`，不下实盘单。**
 
 相关：[[RUNBOOK_SHADOW.md](RUNBOOK_SHADOW.md)]、[[RESEARCH_PROTOCOL.md](RESEARCH_PROTOCOL.md)]。
@@ -26,7 +27,7 @@
 | 标签 | `label_fwd_20d` = **池内 demean** 后的超额，不是原始收益；**底价须先复权**（见 §1.4）。**池内 demean** = 逐日减去**当天全体有标签样本的等权均值**（`groupby(date)[label] - mean`）；那个均值**就是等权池收益**，所以减完剩下的是「相对 hs300 等权」的超额 —— 也正是对照轨 R 检验的那条基线。口径细节：`pandas.mean()` 跳过 NaN ⇒ 基线只含**当天有标签**的名字 | `dataset/labels.py::attach_label_column` 默认 `neutralize="demean"` |
 | 训练/评估切分 | **purge ≥ 60 交易日**，复用 `evaluation/walk_forward.py` | 协议 `MAX_PURGE_DAYS=60` |
 | 主指标 | **rank-IC（Spearman）与 Pearson IC**，在**调仓日**网格上算；TOP-K 相对**池等权**的逐期超额（gross 与 net 并列）。**IC 不扣成本**（见下）；「中性化」在这里是恒等变换（见下） | 协议「模型晋级」；口径订正见 §5.6 |
-| 次指标 | 净值、回撤、换手 —— **仅作沟通**，须标注独立期数（n≈12/年）无统计功效 | — |
+| 次指标 | 净值、回撤、换手 —— **仅作沟通**，须标注独立期数（n≈12/年）无统计功效。回撤**按日频逐日打点**（N3，§5.10）：数据来源是 `daily.tracks`，**不是** `equity_curve.csv` 的调仓网格口径 | — |
 | 对照轨 | **R**：随机分数，相对池等权超额应 ≈ 0（否则 harness 有泄漏或记账错） | 协议置换检验 |
 | 缺失截面 | 信号日**无可用截面** ⇒ 顺延上一期持仓，换手与成本均为 0（不空仓、不算新开仓） | B1 |
 | 前瞻未完成 | 持仓**无 T+20 收益** ⇒ 该期剔出 NAV 并计入 `dropped_periods`（不作为 0 收益复合） | B1 |
@@ -108,7 +109,7 @@ demo 侧**不复用**平台这段代码（`demo/sources.py` 自带 as-of 因子 
 | 交付 | 说明 |
 |------|------|
 | CLI | `python -m quant_model_platform.tools.demo_hs300_20d_top20` |
-| 输出目录 | `--out-dir`：`summary.json`、`equity_curve.csv`、`rebalances.csv`、**`metrics_by_date.csv`**（✅ B5 已交付，逐日主指标）、**`quantiles_by_date.csv`**（✅ N1 已交付，逐日分位梯子）、**`metadata.json`**（B4：provenance，且**最后写** ⇒ 它的 digest 覆盖其余五个） |
+| 输出目录 | `--out-dir`：`summary.json`、`equity_curve.csv`、`rebalances.csv`、**`metrics_by_date.csv`**（✅ B5 已交付，逐日主指标）、**`quantiles_by_date.csv`**（✅ N1 已交付，逐日分位梯子）、**`daily_nav.csv`**（✅ N3 已交付，逐日净值，**仅在带价量时产出**）、**`metadata.json`**（B4：provenance，且**最后写** ⇒ 它的 digest 覆盖其余六个） |
 | 文档 | 本文件 ✅；RUNBOOK 一节「Demo 回测」**未写**（2026-10-15 核：三个 RUNBOOK 里都没有 demo 段落，§8 的 CLI 示例目前是本文件内唯一的运行说明） |
 | 后续（可选） | `GET /api/model-training/demos/...` + 训练域 Tab（API/UI，非 MVP） |
 
@@ -144,7 +145,9 @@ caveats[]
   `trade_date, track, pool_basis, n_pool, pool_return, pool_return_wide, n_wide, n_scored, n_joined, n_priced, pricing, carried, ic_rank, ic_pearson, topk_mean, excess_gross, cost, excess_net` —— 一行一个 `(调仓日, 轨)`，池那几列每行重复（基准若中途变了，不可能被忽略）。**缺数写空单元格，不写 `None`**。`topk_mean` 从净值链路的 `gross_return` **抄**，不重算 ⇒ 与 `rebalances.csv` 逐位一致。
 - ✅ **`quantiles_by_date.csv` 列（N1，2026-10-15）**：`trade_date, track, bucket, n, mean_return, pool_return, excess_return` —— 一行一个 `(调仓日, 轨, 档)`，共 10 档，**档 1 = 当天分数最高的一档**。`pool_return` **每行重复**：同一天的十档共用同一个基准（一天一个值，测试钉住），且 `excess_return = mean_return − pool_return` 逐行精确。薄截面下**空档保留行、`n = 0`、数值列留空**（不写 `None`、不删行）。⚠️ **它量的是分数不是账本** —— 同一份分数换任何 `--top-n`，这个文件**逐字节不变**（§5.8，也是它的自证之一）。
 - ✅ **`primary.quantiles` 块（N1）**：`{buckets, basis, tracks{baseline|model|control_random → {monotonicity, spread_top_bottom, buckets[...]}}, comparisons{model_minus_baseline, control_random_minus_baseline}, note}`。每个档位块是 `{bucket, n_mean, n_dates, mean, excess_mean, excess_t_stat, excess_mde_80, annualized_excess}` —— **逐日明细一律进 CSV，块里只放汇总**，两边由同一个 `rows` 派生（不可能不一致）。`comparisons` 只有两条：模型减基线、对照减基线（对照减基线**不是**第二条独立证据，它只是把 A 的头部效应换个零点重新表述，见 §5.7）。
-- **`nav` 不存在**：净值在 `equity_curve.csv`（调仓网格口径，**非日频**）。`caveats[]` 里带上期数与功效限制，报告与 UI 必须**先展示主指标**，净值旁标注口径 —— 这条纪律不变。
+- ✅ **`daily` 块（N3，2026-10-15）**：`{grid, note, tracks{baseline|model|control_random|pool}, relative, coverage, reconcile}`。`tracks[*]` = `{total_return, max_drawdown, max_drawdown_net, total_return_net, peak_to_trough_days, time_underwater_share, ann_vol, downside_deviation, worst_day, n_days}`；`relative[*_vs_pool]` 同结构；`reconcile` 是**自证块**（`gross_max_abs_gap` / `gross_passed` / `net_gap_vs_period_row` / `net_gap_bound`），见 §5.10。逐日明细进 `daily_nav.csv`：
+  `trade_date, rebalance_date, {baseline,model,control_random,pool}_{gross,net}, {baseline,model,control_random}_vs_pool` —— 一行一个交易日，共 2591 行（全历史）。**不带价量时整块为 `null` 且不产出 CSV**（`--bundle` 手搓夹具即此情形），此时工具在 stderr 打印 `note:`，回撤退回调仓网格口径。
+- **净值有两套口径，别混**：`equity_curve.csv` 是**调仓网格**（每期开盘→开盘，130 点，前几批报的就是它）；`daily_nav.csv` 是**日频收盘**（2591 点）。**要读回撤读后者**（§5.10 注意事项 1 解释了为什么前者不保证更浅）。`caveats[]` 里带上期数与功效限制，报告与 UI 必须**先展示主指标**，净值旁标注口径 —— 这条纪律不变。
 
 ---
 
@@ -220,8 +223,9 @@ caveats[]
 | **N1b** ✅ | **宽度扫描**：同一窗口跑 `--top-n` 10/20/50/100（**不新增仓库代码**，复用既有旋钮） | 0.5d | 见 §5.8 —— A 的 t 在 N=20 最高（1.87）但**四个点全部落在一个标准误内**；把嵌套 book 解成名次区间后得到本批最强的数：**悬崖在 20 名**（1–20 名 +1.087pp，t=2.33；21–100 名 +0.002pp） |
 | **N2** ✅ | **跨池复核**：同窗口、同 A 轨规则，换 `csi500`/`csi1000`（无 `--source-job-id` ⇒ **B 轨不存在**，工具打印警告并继续） | 0.5d | 见 §5.9 —— 账面结论同号同量级（+1.03 / +0.97 / +0.84 pp/期），但显著性单调衰减（t 1.62→1.47→1.05）；**头部尖峰不随池保持**，那是「按比例切档」的必然而非新证据 |
 | **N1c** ✅ | 顺带修掉 `primary.pool` 的 `n_pool_mean` / `n_pool_min` / `wide_basis_n_mean`：写成了**集合推导** ⇒ 算的是「不同取值的平均」（263.6）而不是逐日平均（**299.2**），并把「前瞻窗未完成」的日子算进池尺寸 ⇒ `n_pool_min` 被报成 **0**（真的是**凭空造出一个零名池**） | — | 见 §5.7 末 —— 三个字段纯描述性、不参与任何结论（已逐叶对拍：六份产物只有这三个叶子变，四个 CSV 逐字节不变）；已补两条回归测试，**把 bug 还原后两条都红** |
+| **N3** ✅ | **日频净值**：新建 `demo/daily.py`，逐日给每本书打点 ⇒ 回撤不再是「调仓网格上的 130 个点」。新增 `summary.json["daily"]` + `daily_nav.csv` | 1.5d | 见 §5.10 —— 每期链式 == 该期行（**8.9e-15**），全序列连乘 == `Π(1+gross)`（**3e-15**），期频数字**逐位未动**（104 增 0 删）。⚠️ 日频回撤**不保证**比网格更深（A 更深、B 更浅，因为网格是开盘→开盘、日频是收盘→收盘）；⚠️ 「B 回撤更低」**仍然读不成结论**（十年只有 ~4 段独立回撤事件） |
 
-后续（非 MVP）：API + UI；`MODEL_SCORE_ADAPTER` 走查；日频 NAV 与日频回撤。
+后续（非 MVP）：API + UI；`MODEL_SCORE_ADAPTER` 走查。（日频 NAV 与日频回撤 **N3 已交付**，见 §5.10。）
 
 ### 5.1 B2 对账证据（2026-10-15，`5decfed`）
 
@@ -364,7 +368,7 @@ t 按 √期数 缩放，所以把窗口从 1 年放到全历史，同样一个 
 | 每期 net | **+1.2033pp** | +0.8319pp | +0.6904pp | −0.0251pp |
 | 每期 gross | **+1.3337pp** | +0.9780pp | +0.8373pp | +0.2351pp |
 | 累计 net | **+166.18%** | +108.41% | +58.99% | −20.79% |
-| max drawdown | −71.72% | −58.36% | −57.49% | −41.88% |
+| max drawdown（**调仓网格口径**，日频口径见 §5.10） | −71.72% | −58.36% | −57.49% | −41.88% |
 | 平均单边换手 | 0.4862 | 0.5438 | 0.5477 | 0.9677 |
 | t（net） | 1.46 | 1.30 | 0.99 | −0.05 |
 | **t（gross）** | **1.62** | **1.53** | **1.21** | **0.48** ✅ |
@@ -652,7 +656,54 @@ demo 的 B 轨**不复用 live 的模型文件**：它从 job 读**配方**（`m
 | summary 每档 == CSV 重算 | ✅ |
 | **梯子不随宽度移动** | ✅ 四档的 `quantiles.tracks` 逐位相同、`quantiles_by_date.csv` **逐字节相同** |
 | 每个输出文件都有 digest 且与磁盘字节相符 | ✅（`metadata.json` 自哈希除外，构造上不可能相符） |
-| 严格 JSON（`parse_constant` 拒绝裸 `NaN`/`Infinity`） | ✅ 六份全过 |
+| 严格 JSON（`parse_constant` 拒绝裸 `NaN`/`Infinity`） | ✅ 六份全过（N3 后为**七份**） |
+
+---
+
+### 5.10 N3 日频净值（2026-10-15）：回撤从「被跨过去」变成「测出来」
+
+**问题**：`equity_stats` 的回撤打在**调仓网格**上 —— 十年只有 130 个点（13 个/年），所以每个 20 日持仓期**内部的谷底全部被跨过去**。契约 :29 自己写着这条数「仅作沟通」。§5.9 想把「B 在 2025/2026 涨得少、但长期回撤低」这句话读出来时，发现**根本没有那把尺子**。
+
+**做法**：新建 `demo/daily.py`。每本书的每一期，用 `holding_path` 逐个标的建一条路径 —— 建仓**开盘价**买入、每日**收盘价**打点、出场**开盘价**卖出、之后冻结为现金（卖掉了就不再赚钱）。整本书 = 这些路径的**等权均值**；现金（自己的建仓日还没到）按 1.0 计。关键设计：`holding_path` 就是 `forward_return` 的实现本体（`forward_return` 变成它的标量视图），**不是复制的第二份规则** —— 日频和期频不可能各跑各的。
+
+**为什么可信 ——「一期日频因子的连乘必须精确等于该期的 `1 + gross_return`」**：
+
+| 检查项 | 实测（全历史 129 期 × 4 本书） |
+|---|---|
+| 每期日频链 == 该期行（gross） | ✅ 最大偏差 **8.9e-15**（浮点噪声，全部四本都 ≤2.5e-15 量级） |
+| 全序列连乘 == `Π(1+gross_return)` | ✅ 逐本 **3e-15** |
+| 成本口径差（日频乘性 vs 行内加性 `gross − cost`） | ✅ 报出来的 `net_gap_vs_period_row` 与推导上界 `gross × cost` **十位小数相同**（baseline 3.809797e-4 vs 3.809798e-4），**是推出来的不是拍的** |
+| 期频数字有没有被带动 | ✅ 与 §5.9 的 `n10` 逐叶对拍：**104 增 / 0 删**，新增全在 `daily.*`；四个 CSV 的期频列**逐位不变** |
+
+**数据来源零新增**：`sources.build_bundle` 本来就把清洗+复权后的整段价量装进 `payload["prices"]`，只是算完 `forward_returns` 就扔了。所以这是**接线**，不是取数。
+
+**结果（全历史 2591 个交易日，closing marks）**：
+
+| | A（规则 60:40） | B（模型） | R（随机） | 池等权 |
+|---|---|---|---|---|
+| max drawdown（gross） | **−70.51%** | **−54.45%** | −38.97% | −40.74% |
+| max drawdown（net） | −71.95% | −56.69% | −48.22% | −40.74% |
+| 年化波动 | 29.12% | 22.74% | 20.96% | 18.90% |
+| 水下时间占比 | 94.75% | 96.84% | 98.30% | 98.65% |
+| 峰→谷（交易日） | 606 | 655 | 535 | 279 |
+| 累计收益 | +215.08% | +151.45% | +10.86% | +19.43% |
+
+**相对池**（三本书都基本满仓、一起随市场沉浮 ⇒ B 的 alpha 只能在这条上看）：
+
+| | max drawdown | 峰→谷 | 累计收益 |
+|---|---|---|---|
+| A vs 池 | −63.76% | 891 | +163.82% |
+| **B vs 池** | **−42.13%** | 660 | +110.54% |
+| R vs 池 | −35.09% | 1915 | −7.17% |
+
+**四条必须一起读的注意事项**：
+
+1. **日频回撤不保证比网格回撤更深 —— 实测 A 更深、B 更浅**（网格：A −71.72% / B −58.36%）。**这不是 bug，是两套数的打点时刻不同**：网格净值是**开盘→开盘**（每期 entry open 买、exit open 卖），日频是**收盘→收盘**。网格的峰值出现在**交棒那天的开盘一瞬**（B 是 2021-02 那一段，网格峰值 2.790），日频按收盘打点**永远取不到它**（B 的日频峰值 2.690）。所以两者**不是互相嵌套的抽样**，「更细就一定更深」这个直觉在这里不成立。**要读回撤读日频那条**（收盘口径）；网格那个数保留只是因为前几批报的是它。
+2. **覆盖率**：`overlap_days` = 出场被跌停推迟、以致上一期还在持有时下一期**已经买入**的天数 —— A **110** / B **202** / R **80** / 池 **4471**（池持 300 只票，几乎每期都有票被推迟，所以它的天数最多）。这些天里链式连乘**同时**乘了两本书的因子，等于把那一小撮延迟仓位**重复计了一次暴露**；真实账户会拆分资金。这是**已计数、已披露**的近似，不是隐藏偏差 —— 而且**总收益不受影响**（链式仍精确）。另：四本书各有 **1 期 `periods_without_a_book`**（最后一个信号日的前瞻窗还没跑完），该期按持有不动处理、不按 0 收益复合。
+3. **功效没有因此变好。** 十年只有 ~4 段独立回撤事件，比较两个 `max_drawdown` 是**1–3 个独立事件**的比较；日频收益又**高度重叠**（有效样本远小于 2591）。所以一并报了 `downside_deviation` / `worst_day` / `time_underwater_share` / `peak_to_trough_days`。**「B 的回撤比 A 低」这句话目前仍然读不成结论** —— 它只是**终于被测量了**。
+4. **年化波动两套口径差 ~14%**（A：网格 33.14% vs 日频 29.12%）。两者估的是同一个量，而 130 个样本的 sd 本身就有 ~6% 标准误 —— 差距在这个量级上不构成发现，但结论是**网格口径的 vol 不要单独引用**。
+
+**已知剩余裂缝**（写在这里而不是抹平）：`carried` 期的路径按**它自己的**信号日建（与期频引擎一致，全历史实测 0 期）；`days_beyond_window` 全历史为 **0**（最后一个信号日的窗口没跑出界，网格不需要越界裁剪）；一本书**全无报价**时 `daily` 整块为 `null` 且不产出 CSV（退化路径有测试钉住，并往 stderr 打 `note:`）。
 
 ---
 

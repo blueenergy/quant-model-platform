@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from quant_model_platform.demo.calendar import rebalance_signal_dates
 from quant_model_platform.demo.portfolio import (
     COST_PER_SIDE,
     ROUND_TRIP_COST_RATE,
@@ -13,6 +14,7 @@ from quant_model_platform.demo.portfolio import (
     one_way_turnover,
     simulate_track,
 )
+from quant_model_platform.demo.sources import forward_returns_by_signal_date
 from quant_model_platform.tools.demo_hs300_20d_top20 import main
 
 
@@ -255,6 +257,80 @@ def test_cli_writes_the_provenance_of_its_own_outputs(tmp_path: Path):
         "metrics_by_date.csv",
         "quantiles_by_date.csv",
     }
+
+
+def _bars(days, seed):
+    """An ordinary price history: high and low apart, so no bar is a limit."""
+    rows = []
+    for index, day in enumerate(days):
+        open_ = 10.0 + 0.4 * seed + 0.1 * ((index * (seed + 1)) % 6)
+        close = open_ + 0.1 * ((index * (seed + 2)) % 4)
+        rows.append(
+            {
+                "trade_date": day,
+                "open": open_,
+                "close": close,
+                "high": max(open_, close) * 1.02,
+                "low": min(open_, close) * 0.98,
+            }
+        )
+    return rows
+
+
+def _priced_bundle(days, names, *, horizon=20):
+    """The same bundle, plus the price history the returns were built from.
+
+    Its forward returns come out of those prices rather than being made up,
+    because the daily NAV reconciles against the very entry and exit bars the
+    rules would have picked -- a hand-written return would have nothing to
+    reconcile with.
+    """
+    window = days[-252:]
+    signals = rebalance_signal_dates(window, interval=horizon)
+    prices = {name: _bars(days, seed) for seed, name in enumerate(names)}
+    forwards = forward_returns_by_signal_date(prices, signals, horizon=horizon)
+    bundle = _bundle(days, names)
+    bundle["forward_returns"] = forwards
+    bundle["prices"] = prices
+    return bundle
+
+
+def test_cli_marks_the_book_every_session_when_the_bundle_carries_prices(tmp_path: Path):
+    days = [f"2025{i:04d}" for i in range(1, 261)]
+    names = [f"S{i:02d}" for i in range(30)]
+    path = tmp_path / "bundle.json"
+    path.write_text(json.dumps(_priced_bundle(days, names)), encoding="utf-8")
+    out = tmp_path / "out"
+
+    code = main(
+        ["--bundle", str(path), "--years", "1", "--top-n", "10", "--rebalance-days", "20", "--out-dir", str(out)]
+    )
+
+    assert code == 0
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    daily = summary["daily"]
+    assert daily["reconcile"]["gross_passed"] is True
+    # the window calendar is the whole grid here: the last priced exit still
+    # lands inside it, and only the unpriced tail period has no book at all
+    assert daily["grid"]["n_days"] == summary["window_trading_days"] == 252
+    assert daily["coverage"]["periods_without_a_book"]["baseline"] == 1
+    assert set(daily["relative"]) == {"baseline_vs_pool", "model_vs_pool", "control_random_vs_pool"}
+    assert (out / "daily_nav.csv").is_file()
+    meta = json.loads((out / "metadata.json").read_text(encoding="utf-8"))
+    assert "daily_nav.csv" in {entry["name"] for entry in meta["outputs"]}
+
+
+def test_cli_without_prices_keeps_the_drawdown_on_the_rebalance_grid(tmp_path: Path):
+    """A hand-written bundle has no history to mark, and that degrades, not raises."""
+    days = [f"2025{i:04d}" for i in range(1, 261)]
+    out = tmp_path / "out"
+
+    code = main(["--bundle", str(_write_bundle(tmp_path, days)), "--years", "1", "--out-dir", str(out)])
+
+    assert code == 0
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert summary["daily"] is None
+    assert not (out / "daily_nav.csv").exists()
 
 
 def test_cli_writes_the_primary_block(tmp_path: Path):

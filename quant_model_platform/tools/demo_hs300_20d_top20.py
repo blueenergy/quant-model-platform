@@ -156,6 +156,37 @@ def _write_quantiles_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
             writer.writerow({key: ("" if row.get(key) is None else row.get(key)) for key in fieldnames})
 
 
+def _write_daily_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    """Session-by-session NAV per book, one row per trading day.
+
+    ``rebalance_date`` is the signal date whose holding window owns the day, so
+    the file joins back to ``rebalances.csv`` without guessing. ``_net`` and
+    ``_gross`` differ only by the cost paid at each rebalance; ``_vs_pool`` is
+    the book over the benchmark, which is the series a drawdown claim should be
+    read off -- three fully invested books mostly draw down with the market.
+    """
+    fieldnames = [
+        "trade_date",
+        "rebalance_date",
+        "baseline_gross",
+        "baseline_net",
+        "model_gross",
+        "model_net",
+        "control_random_gross",
+        "control_random_net",
+        "pool_gross",
+        "pool_net",
+        "baseline_vs_pool",
+        "model_vs_pool",
+        "control_random_vs_pool",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: ("" if row.get(key) is None else row.get(key)) for key in fieldnames})
+
+
 def _resolve_window(days: Any, *, years: int) -> Optional[List[str]]:
     """Window or None; a short history is a hard error, never a quiet shrink.
 
@@ -191,7 +222,8 @@ def _caveats(*, top_n: int, rebalance_days: int, backfill_purge: int, rebalance_
         f"net return pays {ROUND_TRIP_COST_RATE * 10_000:.1f} bps per 100% turnover; the opening book pays one side, later swaps both",
         "a signal day with no usable cross-section holds the previous book at zero turnover, it does not go to cash",
         "a period whose forward window has not happened yet is excluded from the NAV and counted in dropped_periods",
-        "drawdown and the equity curve are on the rebalance grid, not daily",
+        "drawdown appears twice: the track blocks take it on the rebalance grid (about 13 points a year), daily.tracks takes it every session; the daily one is the measurement, the grid one is kept for continuity",
+        "daily.relative is the book over the pool; absolute drawdowns of three fully invested books are mostly the market's",
         f"the window holds about {rebalance_count} independent {rebalance_days}-day periods; the NAV cannot support a 'better' claim, only the per-period metrics can, and they need the count to be large",
         f"top_n={top_n} matches the contract's primary (10) unless overridden; rebalance_days={rebalance_days} follows the live preset",
         f"track B's backfill trains with a {backfill_purge}-day embargo; the live scorer uses none, and the ranking moves with that choice (see model_overlap)",
@@ -256,8 +288,22 @@ def _emit_report(
         # horizon only the flag can name; --from-mongo builds them from that
         # same flag, so there the label is a fact rather than an assumption.
         horizon_declared_by="rebalance_days" if args.from_mongo else "rebalance_days (assumed; a bundle declares none)",
+        prices=payload.get("prices"),
     )
     primary = report["primary"]
+    daily = report["daily"]
+    if daily is None:
+        print(
+            "note: no daily NAV -- the payload carried no price history, so drawdown stays on the "
+            "rebalance grid (a hand-written bundle has no prices; --from-mongo does)",
+            file=sys.stderr,
+        )
+    elif not daily["reconcile"]["gross_passed"]:
+        print(
+            "warning: the daily NAV does not reconcile with the period rows; the drawdown below "
+            "describes a different book than the returns do",
+            file=sys.stderr,
+        )
     if not primary["power"]["n_dates"] or not primary["join"]["joined_names"]:
         print(
             "warning: the primary evidence is empty -- no dated cross-section joined to a forward "
@@ -279,6 +325,7 @@ def _emit_report(
         "model_overlap": payload.get("model_overlap"),
         "model_training": payload.get("model_training"),
         "primary": primary,
+        "daily": daily,
         "cost": _cost_block(),
         "window_start": window[0] if window else None,
         "window_end": window[-1] if window else None,
@@ -305,6 +352,8 @@ def _emit_report(
         _write_rebalances_csv(args.out_dir / "rebalances.csv", report["rebalances"])
         _write_metrics_csv(args.out_dir / "metrics_by_date.csv", report["metrics_by_date"])
         _write_quantiles_csv(args.out_dir / "quantiles_by_date.csv", report["quantiles_by_date"])
+        if report["daily_nav"]:
+            _write_daily_csv(args.out_dir / "daily_nav.csv", report["daily_nav"])
         # Last, so its digest list covers everything else in the directory.
         metadata = build_provenance(
             args=args,
