@@ -193,6 +193,67 @@ def test_cli_writes_summary(tmp_path: Path):
     assert (out / "rebalances.csv").is_file()
 
 
+def _write_bundle(tmp_path: Path, days):
+    bundle = _bundle(days, [f"S{i:02d}" for i in range(30)])
+    path = tmp_path / "bundle.json"
+    path.write_text(json.dumps(bundle), encoding="utf-8")
+    return path
+
+
+def test_cli_years_zero_uses_the_whole_history(tmp_path: Path):
+    """A 252-day window is 12 periods: too few to say anything. Widening must be free."""
+    days = [f"2025{i:04d}" for i in range(1, 261)]
+    out = tmp_path / "out"
+
+    code = main(["--bundle", str(_write_bundle(tmp_path, days)), "--years", "0", "--out-dir", str(out)])
+
+    assert code == 0
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert summary["window_trading_days"] == 260
+    assert summary["rebalance_count"] == 13
+
+
+def test_cli_names_the_run_by_its_real_window_not_a_label(tmp_path: Path):
+    days = [f"2025{i:04d}" for i in range(1, 261)]
+    out = tmp_path / "out"
+
+    code = main(["--bundle", str(_write_bundle(tmp_path, days)), "--years", "0", "--out-dir", str(out)])
+
+    assert code == 0
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert summary["demo_id"] == f"demo-hs300-20d-top10-{days[0]}-{days[-1]}"
+
+
+def test_cli_top_n_defaults_to_the_contract_primary(tmp_path: Path):
+    days = [f"2025{i:04d}" for i in range(1, 261)]
+    out = tmp_path / "out"
+
+    code = main(["--bundle", str(_write_bundle(tmp_path, days)), "--years", "1", "--out-dir", str(out)])
+
+    assert code == 0
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert summary["top_n"] == 10
+
+
+def test_cli_writes_the_provenance_of_its_own_outputs(tmp_path: Path):
+    days = [f"2025{i:04d}" for i in range(1, 261)]
+    out = tmp_path / "out"
+
+    code = main(["--bundle", str(_write_bundle(tmp_path, days)), "--years", "1", "--out-dir", str(out)])
+
+    assert code == 0
+    meta = json.loads((out / "metadata.json").read_text(encoding="utf-8"))
+    assert meta["protocol"]["max_purge_days"] == 60
+    assert meta["protocol"]["label_horizon_days"] == 20
+    assert meta["window"]["trading_days"] == 252
+    assert meta["requested"]["top_n"] == 10
+    assert {entry["name"] for entry in meta["outputs"]} == {
+        "summary.json",
+        "equity_curve.csv",
+        "rebalances.csv",
+    }
+
+
 def test_cli_errors_instead_of_shrinking_the_window(tmp_path: Path, capsys):
     bundle = {
         "trading_days": ["20250101", "20250102"],

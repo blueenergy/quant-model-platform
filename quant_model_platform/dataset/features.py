@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import Dict, List, Mapping, Sequence
 
 import pandas as pd
 
@@ -12,6 +12,8 @@ import pandas as pd
 class FeatureSpec:
     name: str
     dtype: str = "float64"
+    #: Declared point-in-time policy for the feature's *source*, not an
+    #: observation about the snapshot. See registry_document().
     pit: bool = True
     missing_flag: bool = True
     source: str = "synthetic"
@@ -51,9 +53,41 @@ def add_missing_flags(frame: pd.DataFrame, feature_names: Sequence[str]) -> pd.D
     return out
 
 
-def registry_document(registry: Sequence[FeatureSpec] | None = None) -> List[Dict[str, object]]:
+def annotate_population(
+    entries: Sequence[Mapping[str, object]], frame: pd.DataFrame
+) -> List[Dict[str, object]]:
+    """Add ``populated`` / ``fill_rate`` per entry, read off the frame itself."""
+    n = int(len(frame))
+    out: List[Dict[str, object]] = []
+    for entry in entries:
+        doc = dict(entry)
+        name = str(doc.get("name") or "")
+        if name and name in frame.columns and n:
+            filled = int(frame[name].notna().sum())
+            doc["populated"] = filled > 0
+            doc["fill_rate"] = round(filled / n, 4)
+        else:
+            doc["populated"] = False
+            doc["fill_rate"] = 0.0
+        out.append(doc)
+    return out
+
+
+def registry_document(
+    registry: Sequence[FeatureSpec] | None = None,
+    frame: pd.DataFrame | None = None,
+) -> List[Dict[str, object]]:
+    """The feature registry, as a record when ``frame`` is given and a plan otherwise.
+
+    ``pit`` is a declared policy about a feature's *source*; it does not mean the
+    snapshot holds the column. Ten of the fourteen entries are never populated by
+    the production path (``dataset/production.py``), so a manifest built without
+    the frame describes the plan rather than the data. Passing ``frame`` adds the
+    observed fill so the two can be read apart.
+    """
     reg = registry or DEFAULT_FEATURE_REGISTRY
-    return [
+    docs: List[Dict[str, object]] = [
         {"name": f.name, "dtype": f.dtype, "pit": f.pit, "missing_flag": f.missing_flag, "source": f.source}
         for f in reg
     ]
+    return annotate_population(docs, frame) if frame is not None else docs

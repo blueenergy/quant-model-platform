@@ -6,9 +6,9 @@ from typing import List, Sequence
 
 
 def trading_days_per_year(years: int) -> int:
-    if years not in (1, 2):
-        raise ValueError("years must be 1 or 2")
-    return 252 if years == 1 else 504
+    if years < 1:
+        raise ValueError("years must be >= 1; a window covering everything is the caller's job")
+    return 252 * years
 
 
 def window_trading_days(all_days: Sequence[str], *, years: int = 1) -> List[str]:

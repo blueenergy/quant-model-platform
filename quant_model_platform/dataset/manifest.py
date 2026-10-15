@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import pandas as pd
 
-from quant_model_platform.dataset.features import registry_document
+from quant_model_platform.dataset.features import annotate_population, registry_document
 from quant_model_platform.storage.s3 import canonical_snapshot_id
 
 
@@ -76,7 +76,11 @@ def build_manifest(
     snapshot_id: Optional[str] = None,
     use_canonical_snapshot: bool = False,
 ) -> DatasetManifest:
-    reg = list(feature_registry or registry_document())
+    # The registry goes in as a record of this frame, not as the MVP's plan: the
+    # production path populates 4 of the 14 features, and a manifest that listed
+    # all 14 as point-in-time was making a claim the data did not support.
+    declared = list(feature_registry) if feature_registry is not None else registry_document()
+    reg = annotate_population(declared, frame)
     extra = {"index_code": index_code, "start_date": start_date, "end_date": end_date, "registry": reg}
     h = content_hash(frame, extra=extra)
     if use_canonical_snapshot:

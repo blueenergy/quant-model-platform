@@ -39,6 +39,7 @@ from quant_model_platform.demo.portfolio import (
     SELF_COMPUTED_SCORE,
     compare_tracks,
 )
+from quant_model_platform.demo.provenance import build_provenance, write_provenance
 from quant_model_platform.demo.track_b import (
     cross_section_rank_correlation,
     load_shadow_predictions,
@@ -96,7 +97,18 @@ def _write_rebalances_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
 
 
 def _resolve_window(days: Any, *, years: int) -> Optional[List[str]]:
-    """Window or None; a short history is a hard error, never a quiet shrink."""
+    """Window or None; a short history is a hard error, never a quiet shrink.
+
+    ``years <= 0`` means the whole history handed in: ``--start-date/--end-date``
+    already say how far back the data goes, and the point of the longer window is
+    to stop re-choosing it. A positive value still truncates to the last N years.
+    """
+    if years <= 0:
+        whole = sorted({str(d)[:8] for d in days if str(d).strip()})
+        if not whole:
+            print("error: no trading days in the window", file=sys.stderr)
+            return None
+        return whole
     try:
         return window_trading_days(days, years=years)
     except ValueError as exc:
@@ -113,22 +125,31 @@ def _cost_block() -> Dict[str, Any]:
     }
 
 
-def _caveats(*, top_n: int, rebalance_days: int, backfill_purge: int) -> List[str]:
+def _caveats(*, top_n: int, rebalance_days: int, backfill_purge: int, rebalance_count: int = 0) -> List[str]:
     return [
         "gross return is the equal-weight mean of forward_return over the hold window (next open to next open)",
         f"net return pays {ROUND_TRIP_COST_RATE * 10_000:.1f} bps per 100% turnover; the opening book pays one side, later swaps both",
         "a signal day with no usable cross-section holds the previous book at zero turnover, it does not go to cash",
         "a period whose forward window has not happened yet is excluded from the NAV and counted in dropped_periods",
         "drawdown and the equity curve are on the rebalance grid, not daily",
-        f"one year holds about 252/{rebalance_days} ~= {252 // rebalance_days} independent periods: the NAV cannot support a 'better' claim, only the per-day metrics can",
-        f"top_n={top_n} and rebalance_days={rebalance_days} are the run's parameters; the frozen contract's primary/ sensitivity pair is still open (section 9)",
+        f"the window holds about {rebalance_count} independent {rebalance_days}-day periods; the NAV cannot support a 'better' claim, only the per-period metrics can, and they need the count to be large",
+        f"top_n={top_n} matches the contract's primary (10) unless overridden; rebalance_days={rebalance_days} follows the live preset",
         f"track B's backfill trains with a {backfill_purge}-day embargo; the live scorer uses none, and the ranking moves with that choice (see model_overlap)",
     ]
 
 
-def _demo_id(args: argparse.Namespace, index_code: str) -> str:
-    """Name the run by what it measured, not by the contract's headline title."""
-    return f"demo-{index_code}-{args.rebalance_days}d-top{args.top_n}-{args.years}y"
+def _demo_id(args: argparse.Namespace, index_code: str, window: Sequence[str] = ()) -> str:
+    """Name the run by what it measured, not by the contract's headline title.
+
+    The window goes in as its real bounds rather than as ``{years}y``: a label is
+    a claim about the data, and once ``--years 0`` means "everything you handed
+    in" the label can disagree with the window it names.
+    """
+    if window:
+        span = f"{str(window[0])[:8]}-{str(window[-1])[:8]}"
+    else:
+        span = f"{args.years}y"
+    return f"demo-{index_code}-{args.rebalance_days}d-top{args.top_n}-{span}"
 
 
 def _source_block(
@@ -172,7 +193,7 @@ def _emit_report(
         control_seed=args.control_seed,
     )
     summary = {
-        "demo_id": _demo_id(args, index_code),
+        "demo_id": _demo_id(args, index_code, window),
         "status": "equity",
         "years": args.years,
         "top_n": args.top_n,
@@ -196,7 +217,10 @@ def _emit_report(
         "control_r": report["control_r"],
         "comparison": report["comparison"],
         "caveats": _caveats(
-            top_n=args.top_n, rebalance_days=args.rebalance_days, backfill_purge=args.backfill_purge
+            top_n=args.top_n,
+            rebalance_days=args.rebalance_days,
+            backfill_purge=args.backfill_purge,
+            rebalance_count=len(signals),
         ),
     }
     text = json.dumps(summary, indent=2)
@@ -205,6 +229,18 @@ def _emit_report(
         (args.out_dir / "summary.json").write_text(text + "\n", encoding="utf-8")
         _write_equity_csv(args.out_dir / "equity_curve.csv", report["equity_curve"])
         _write_rebalances_csv(args.out_dir / "rebalances.csv", report["rebalances"])
+        # Last, so its digest list covers everything else in the directory.
+        metadata = build_provenance(
+            args=args,
+            index_code=index_code,
+            window=window,
+            signals=signals,
+            source=source or _source_block(args),
+            model_source=payload.get("model_source"),
+            payload=payload,
+            out_dir=args.out_dir,
+        )
+        write_provenance(args.out_dir, metadata)
         print(f"wrote {args.out_dir / 'summary.json'}")
     else:
         print(text)
@@ -400,7 +436,7 @@ def _run_calendar(args: argparse.Namespace) -> int:
         return 2
     signals = rebalance_signal_dates(window, interval=args.rebalance_days)
     payload = {
-        "demo_id": _demo_id(args, args.index_code),
+        "demo_id": _demo_id(args, args.index_code, window),
         "status": "calendar_only",
         "years": args.years,
         "top_n": args.top_n,
@@ -426,8 +462,13 @@ def _run_calendar(args: argparse.Namespace) -> int:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="hs300 20-day TOP20 demo")
-    parser.add_argument("--years", type=int, default=1, choices=(1, 2))
-    parser.add_argument("--top-n", type=int, default=20)
+    parser.add_argument(
+        "--years",
+        type=int,
+        default=0,
+        help="truncate the window to the last N years; 0 (default) uses every date in the coverage",
+    )
+    parser.add_argument("--top-n", type=int, default=10, help="names held per period; the contract's primary is 10")
     parser.add_argument("--rebalance-days", type=int, default=20)
     parser.add_argument(
         "--score-column",
