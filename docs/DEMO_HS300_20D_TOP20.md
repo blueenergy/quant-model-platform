@@ -37,16 +37,20 @@
 
 ### 1.1 模型分来源（B 轨）
 
+**B 轨全部本机自产**。K8s/VOLC 是**独立环境、不可访问**，其 `quant_ml`（含既有 `model_predictions` 与 Shadow 观察）本机够不着 ⇒ demo **不引用任何远端产物**。
+
 | 区间 | 来源 | Mongo 标记 |
 |------|------|------------|
-| `shadow_live_from` 之后 | `model_predictions`（`shadow: true`） | `score_source=shadow_live` |
-| 更早调仓日 | **PIT backfill**（见 §4），按协议 purge=60 | `score_source=backfill_pit` |
+| 本机 Shadow 启用之后 | 本机 `quant_ml.model_predictions` | `score_source=shadow_live` |
+| 更早调仓日 | 本机 **PIT backfill**（见 §4），按协议 purge=60 | `score_source=backfill_pit` |
+
+⚠️ 本机 `quant_ml` 现为**空库**（`model_training_jobs` / `results` / `predictions` / `manifests` 全 0，从未在本机训练过）⇒ **没有现成 `model_id` 可引用**，B 轨第一步必须是在本机跑通一次训练（§5 B3a）。
 
 **边界按日期切，不按「当天有没有分」切** —— 半覆盖的截面不得当完整截面用。
 
 **禁止**：用「全历史 Parquet 一次 refit」给所有过去 T 打分（未来信息泄漏）。  
-Forward **8–12 周 Shadow 观察**仍只认 `shadow_live` 段，不能用 backfill 冒充。  
-**可测替代**：在 Shadow 与 backfill 重叠的调仓日做 rank correlation —— 复现得好，长曲线才可信（§5 B3）。
+Forward **8–12 周 Shadow 观察**若要做，须在**本机**新起（本机 `MODEL_SHADOW_PROFILES` 目前未设），且只认 `shadow_live` 段，不能用 backfill 冒充。  
+**可测替代**：在 Shadow 与 backfill 重叠的调仓日做 rank correlation —— 复现得好，长曲线才可信（§5 B3b）。
 
 ### 1.2 成本口径（2026-10-15 核实）
 
@@ -70,7 +74,7 @@ Forward **8–12 周 Shadow 观察**仍只认 `shadow_live` 段，不能用 back
 - **预置对照**：`portfolio_strategy_param_presets` 共 6 条，研究面多为 10 日调仓，`growth_cycle_index_enhanced_csi1000_top10_20d` 为 20 日。
 - **`finance.stock_scores` 没有 `composite_growth_cycle_score` 列**（实际字段：`composite_score` / `growth_score` / `cycle_score` / `technical_score` / `value_score` / `fundamental_score` / `money_flow_score` …）⇒ A 轨必须自算加权；doc 原稿「优先读存储列」在生产恒为死分支。
 - **成本语义**：`analysis/core/trade_fee_model.py::from_params` / `period_cost_rate`；`portfolio_backtester` 与 `score_backtester` **均不含滑点**。
-- **数据可得性**：本地 `finance.stock_scores` 656 万条、hs300 日更至 20261014 ✅；本地 `quant_ml` **为空**（`model_training_jobs` / `model_predictions` / `dataset_manifests` 全 0，`MODEL_SHADOW_PROFILES` 未设），ML 侧数据在远端（K8s/VOLC）Mongo —— B 轨读数通道须在 B3 前确认。
+- **数据可得性**：本机 `finance.stock_scores` 656 万条、hs300 85.2 万条（2015-01-30 → 2026-10-14）✅；`quant_data.volume_price` 1447 万条（2010-01-04 → 2026-10-15）✅。本机 `quant_ml` **从未训练过**（全 0，`MODEL_SHADOW_PROFILES` 未设）—— B 轨须本机自产，详见 §3.1。
 
 ---
 
@@ -118,14 +122,33 @@ Forward **8–12 周 Shadow 观察**仍只认 `shadow_live` 段，不能用 back
         ┌───────────────┬────────────────┬──────────────────┐
         ▼               ▼                ▼                  ▼
   rebalance grid   Track A 自算      Track B 读数      metrics + NAV
-  (20d / 30d)      finance.stock_    quant_ml          IC / top-K 超额
-                   scores(本地✅)     (远端❓)           + 成本 + 配对统计
+  (20d / 30d)      finance.stock_    本机 quant_ml     IC / top-K 超额
+                   scores(本机✅)    + PIT backfill    + 成本 + 配对统计
 ```
 
-- **运行位置**：开发机 / aipoc（本机可读 `finance`，ML 数据通道见 §1.3）。
+- **运行位置**：**全部本机（WSL）**。K8s/VOLC 是独立环境、不可访问，demo **不引用其任何产物**。
 - **`stock-scoring-system` 不作运行时依赖**：trainer 镜像只含本仓，装不进去。它只作**对账基准**（gross、as-of universe）。它的 forward return 带 `exit_limit_delay_days` / 止损 / regime 分支，把这些拉进 demo 会让「差异来自模型」这个结论不可解释。
-- **A 轨数据**：本地 `finance.stock_scores`，按 `score_date` 取当日 hs300 成员。
-- **B 轨数据**：`quant_ml.model_predictions`；本机为空，B3 前确认远端通道或改为在远端跑。
+- **A 轨数据**：本机 `finance.stock_scores`，按 `score_date` 取当日 hs300 成员。
+- **B 轨数据**：本机 `quant_ml`（由本机 trainer 容器产出）+ 本机 PIT backfill（§4）。
+
+### 3.1 本机环境（核实 2026-10-15）
+
+| 零件 | 状态 |
+|------|------|
+| `quant-model-trainer` 容器 | ✅ 运行中，主进程 `workers.run_loop`，worker `idle`、5s 轮询、心跳正常 |
+| Mongo | ✅ 容器内 `mongodb:27017`（本机 `quant-mongodb`）；`MONGO_DB=finance`、`QUANT_ML_DB=quant_ml` |
+| 训练数据源 | ✅ `finance.stock_scores` hs300 **85.2 万条，2015-01-30 → 2026-10-14** |
+| 价量 | ✅ `quant_data.volume_price` **1447 万条，2010-01-04 → 2026-10-15** |
+| Parquet 落地 | ✅ **文件系统** `/data/quant_ml/parquet`（bind mount `quant-infrastructure/apps/data/quant_ml`，可写）；**本机无 S3/MinIO 依赖** |
+| 提交入口 | ✅ 本机 `quant-api`：`POST /api/model-training/jobs` 等 6 条路由 |
+| 存量训练产物 | ❌ 从未训练过（`quant_ml` 6 集合，除 worker_status 外全 0） |
+| 资源 | 宿主 16 vCPU；trainer 限额 4 vCPU / 32 GB |
+
+> 注意：本机 Mongo 返回的是 **naive UTC**，而宿主 `date` 是 CST（+8）。比对心跳/`created_at` 时必须 +8，否则会把「5 秒前」误读成「8 小时前」。
+
+**窗口含义**：score 数据从 2015-01 起，样本充分。默认 2 年是**快速迭代**取向，不是数据上限。
+
+> **窗口深度上限受 B 轨 PIT backfill 成本约束**：每个调仓日一次 refit，10 年 ≈ 122 次；4 vCPU 下须实测单次耗时再定。
 
 ---
 
@@ -133,8 +156,8 @@ Forward **8–12 周 Shadow 观察**仍只认 `shadow_live` 段，不能用 back
 
 对每个调仓日 **T**（仅当该日无 `shadow_live` 分，或显式 `--force-backfill`）：
 
-1. 从 `finance.stock_scores` + 价量拼 **PIT 面板**（`trade_date <= T`），或复用物化 Parquet 后截断到 T。
-2. 取**晋升 job 的配方**（`model_kind` / `feature_names` / `model_params`，从 `model_training_jobs` 读），在可算标签的样本上 refit：面板截断到 T，且训练窗末再退 **purge = 60 交易日**（协议 `MAX_PURGE_DAYS`，复用 `evaluation/walk_forward.py` 的口径，勿自写）。
+1. 从本机 `finance.stock_scores` + `quant_data.volume_price` 拼 **PIT 面板**（`trade_date <= T`），或复用物化 Parquet 后截断到 T。
+2. 取**本机训练 job 的配方**（`model_kind` / `feature_names` / `model_params`，从本机 `quant_ml.model_training_jobs` 读），在可算标签的样本上 refit：面板截断到 T，且训练窗末再退 **purge = 60 交易日**（协议 `MAX_PURGE_DAYS`，复用 `evaluation/walk_forward.py` 的口径，勿自写）。
 3. 对**当日截面** `trade_date = T` 预测，标记 `score_source=backfill_pit`。
 4. **非调仓日不算分**（≈12 次 refit/年 × 池数）。
 
@@ -149,7 +172,8 @@ Forward **8–12 周 Shadow 观察**仍只认 `shadow_live` 段，不能用 back
 | **B0** | 冻结本契约（本节 §1）；修 doc 内的失实表述 | 0.5d | 本文件 |
 | **B1** | 修 demo 记账 bug：缺失截面=持仓不变且不计换手（区分「无截面」与「前瞻未完成」）、末段不完整期剔出 NAV、`--score-column` 真正生效、`--years` 不足时明确报错；清死代码 | 1d | 单测 + 对照轨 R 相对池等权超额 ≈ 0 |
 | **B2** | A 轨端到端：读 `stock_scores`（as-of 成员）→ 20 日调仓 → 主指标 + 净值；与 `ScoreBacktester.calculate_topk_summary` 同参逐日对账 | 1d | `top_vs_universe` / `universe_mean_return` 逐日一致 |
-| **B3** | B 轨：`shadow_live_from` 日期切片；backfill 换成协议口径（purge=60 + job 配方）；重叠期 rank correlation | 1.5d | 重叠期相关性达标；`quant_ml` 读数通道确认 |
+| **B3a** | **本机跑通训练闭环**：物化 hs300 快照（本机 `stock_scores` + `volume_price` → 本机 parquet root）→ 提交本机 job → worker 训练 → 本机 `quant_ml` 产出 `model_id` 与 `model_predictions` | 1d | 本机 `model_training_results` 有结果；快照落在 `apps/data/quant_ml/parquet` |
+| **B3b** | B 轨接本机 `quant_ml`：按 `shadow_live_from` **日期**切片；backfill 换协议口径（purge=60 + 本机 job 配方）；重叠期 rank correlation | 1.5d | 重叠期相关性达标 |
 | **B4** | 池参数化（hs300 / a500 / csi1000）、窗口 `start/end`、`metadata.json` provenance、与 `process_portfolio_research_jobs` 交叉校验 | 1.5d | 两条链路 A 轨一致 |
 
 后续（非 MVP）：API + UI；`MODEL_SCORE_ADAPTER` 走查；日频 NAV 与日频回撤。
@@ -175,7 +199,8 @@ Forward **8–12 周 Shadow 观察**仍只认 `shadow_live` 段，不能用 back
 | 12 期/年的净值差被当结论 | 报告以主指标打头；净值旁强制标注期数与功效 |
 | Backfill 与 Shadow 分布不一致 | 重叠期 rank correlation 校验；不达标则长曲线只作管道验证 |
 | 成本口径分歧（4 套并存） | §1.2 写死采用「费用 + 单边滑点」，并在 summary 里回显常量 |
-| B 轨数据在远端 Mongo | B3 前确认通道；否则 A 轨与 harness 先落地，B 轨延后 |
+| 本机从未训练过（`quant_ml` 空），B 轨无现成分可用 | B3a 先跑通本机闭环；A 轨与 harness（R 轨）不依赖 B 轨，可并行落地 |
+| 本机 PIT backfill 计算量（每调仓日一次 refit） | 先实测单次 refit 耗时再定窗口深度；必要时降频或复用物化面板截断 |
 | 训练标签（20d demean 超额）与实盘调仓（30d）错配 | 主口径 20d；30d 只作敏感性并标注错配 |
 | `--years` 数据不足被静默降级 | B1 起改为显式报错 / 明确 warn |
 
@@ -196,7 +221,7 @@ python -m quant_model_platform.tools.demo_hs300_20d_top20 \
   --out-dir /tmp/demo-hs300
 ```
 
-环境：`MONGO_URI`（`finance`）、`QUANT_ML_DB`、远端 ML Mongo 通道（待定）。
+环境：本机 `MONGO_URI`（`finance` / `quant_data`）、`QUANT_ML_DB=quant_ml`、`QUANT_ML_PARQUET_ROOT=/data/quant_ml/parquet`。**无 S3、无远端依赖**。
 
 ---
 
@@ -204,5 +229,6 @@ python -m quant_model_platform.tools.demo_hs300_20d_top20 \
 
 - [ ] 主口径 **N=10 / 调仓 20d** 是否认可（原稿为 TOP20 / 20d；实盘是 TOP10 / 30d）
 - [ ] `demo_id` 是否改名去 N（现名 `demo-hs300-20d-top20-1y` 与主口径不符）
-- [ ] B 轨读数：接远端 Mongo，还是把 demo 放到远端跑
-- [ ] 默认窗口 2 年是否够（长期计划下是否需要全窗口 2020–2026）
+- [x] ~~B 轨读数通道~~ → **本机自产**（K8s 不可访问；见 §1.1 / §3.1）
+- [ ] 窗口：默认 2 年（快速迭代）还是拉长（score 数据 2015-01 起、价量 2010 起都够）；受 PIT backfill 成本约束，建议先实测单次 refit 耗时
+- [ ] B3a 物化范围：只物化 hs300，还是顺带 a500/csi1000（B4 池参数化要用）
