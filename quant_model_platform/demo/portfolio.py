@@ -18,7 +18,12 @@ import math
 from statistics import pstdev
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from quant_model_platform.demo.primary import daily_metrics, pool_symbols_by_date, summarize_primary
+from quant_model_platform.demo.primary import (
+    daily_metrics,
+    pool_symbols_by_date,
+    quantile_rows,
+    summarize_primary,
+)
 from quant_model_platform.demo.ranking import random_control_scores, top_n_symbols
 
 #: Fees 7 bps round trip + 10 bps slippage a side.
@@ -210,6 +215,12 @@ def compare_tracks(
         pool_symbols=pool_symbols,
         pool_sources=pool_sources,
     )
+    quantiles_by_date = quantile_rows(
+        {"baseline": scores_a, "model": scores_b, "control_random": random_scores},
+        forward_returns,
+        {"baseline": track_a, "model": track_b, "control_random": track_r},
+        pool_symbols=pool_symbols,
+    )
     primary = summarize_primary(
         metrics_by_date,
         trading_days=trading_days,
@@ -217,6 +228,7 @@ def compare_tracks(
         control_seed=control_seed,
         control_t_max=CONTROL_T_MAX,
         horizon_declared_by=horizon_declared_by,
+        quantile_rows=quantiles_by_date,
     )
     return {
         "track_a": {**public_a, "score_column": score_column_a or SELF_COMPUTED_SCORE},
@@ -230,6 +242,7 @@ def compare_tracks(
         },
         "rebalances": track_a + track_b + track_r,
         "metrics_by_date": metrics_by_date,
+        "quantiles_by_date": quantiles_by_date,
         "primary": primary,
         "equity_curve": [
             {

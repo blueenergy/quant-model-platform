@@ -133,6 +133,29 @@ def _write_metrics_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
             writer.writerow({key: ("" if row.get(key) is None else row.get(key)) for key in fieldnames})
 
 
+def _write_quantiles_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    """The ranking's shape, one row per (date, track, bucket), best bucket first.
+
+    Same discipline as ``metrics_by_date.csv``: the pool return repeats on every
+    row so a benchmark that moved halfway down the file could not go unnoticed,
+    and an absent number is an empty cell rather than the string ``None``.
+    """
+    fieldnames = [
+        "trade_date",
+        "track",
+        "bucket",
+        "n",
+        "mean_return",
+        "pool_return",
+        "excess_return",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: ("" if row.get(key) is None else row.get(key)) for key in fieldnames})
+
+
 def _resolve_window(days: Any, *, years: int) -> Optional[List[str]]:
     """Window or None; a short history is a hard error, never a quiet shrink.
 
@@ -281,6 +304,7 @@ def _emit_report(
         _write_equity_csv(args.out_dir / "equity_curve.csv", report["equity_curve"])
         _write_rebalances_csv(args.out_dir / "rebalances.csv", report["rebalances"])
         _write_metrics_csv(args.out_dir / "metrics_by_date.csv", report["metrics_by_date"])
+        _write_quantiles_csv(args.out_dir / "quantiles_by_date.csv", report["quantiles_by_date"])
         # Last, so its digest list covers everything else in the directory.
         metadata = build_provenance(
             args=args,

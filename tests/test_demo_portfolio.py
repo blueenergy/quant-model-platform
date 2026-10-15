@@ -253,6 +253,7 @@ def test_cli_writes_the_provenance_of_its_own_outputs(tmp_path: Path):
         "equity_curve.csv",
         "rebalances.csv",
         "metrics_by_date.csv",
+        "quantiles_by_date.csv",
     }
 
 
@@ -289,6 +290,48 @@ def test_cli_writes_the_primary_block(tmp_path: Path):
         primary["tracks"]["baseline"]["topk_excess_gross_vs_pool"]["mean"]
     )
     assert not [row for row in rows if "None" in row.values()]
+
+
+def test_cli_writes_the_quantile_ladder(tmp_path: Path):
+    """The ladder end to end: the CSV and the summary must be one computation."""
+    days = [f"2025{i:04d}" for i in range(1, 261)]
+    out = tmp_path / "out"
+
+    code = main(["--bundle", str(_write_bundle(tmp_path, days)), "--years", "1", "--out-dir", str(out)])
+
+    assert code == 0
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    quantiles = summary["primary"]["quantiles"]
+    assert quantiles["buckets"] == 10
+    with (out / "quantiles_by_date.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 3 * 10 * 13
+    assert not [row for row in rows if "None" in row.values()]
+
+    # Every rung the summary reports is the plain mean of that rung's own rows.
+    for track, block in quantiles["tracks"].items():
+        for rung in block["buckets"]:
+            values = [
+                float(row["excess_return"])
+                for row in rows
+                if row["track"] == track and int(row["bucket"]) == rung["bucket"] and row["excess_return"] != ""
+            ]
+            assert rung["n_dates"] == len(values)
+            if values:
+                assert sum(values) / len(values) == pytest.approx(rung["excess_mean"])
+
+    # The rungs partition the day they describe, against the row that says so.
+    joined = {}
+    with (out / "metrics_by_date.csv").open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            joined[(row["trade_date"], row["track"])] = int(row["n_joined"])
+    totals = {}
+    for row in rows:
+        key = (row["trade_date"], row["track"])
+        totals[key] = totals.get(key, 0) + int(row["n"])
+    assert totals
+    for key, total in totals.items():
+        assert total == joined[key]
 
 
 def test_cli_degrades_without_a_source_job(tmp_path: Path):
