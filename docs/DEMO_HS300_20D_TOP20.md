@@ -1,36 +1,76 @@
-# Demo：`demo-hs300-20d-top20-1y`
+# Demo：hs300 模型分 vs 成长周期规则分
 
-与生产 **成长+周期（动量）加权** 排名策略对比：**ML 模型分** 是否在收益、回撤、换手上有改进。  
-**不写 `stock_scores`，不下实盘单。**
+**长期 ML 计划的评估基准**：在 hs300 上，模型分是否**稳定优于**生产的成长+周期加权规则分。  
+主证据是扣成本后的**中性化 IC / top-K 逐日超额**；净值与回撤只作沟通，**不作为结论依据**。  
+**只读生产数据；不写 `stock_scores`，不下实盘单。**
 
 相关：[[RUNBOOK_SHADOW.md](RUNBOOK_SHADOW.md)]、[[RESEARCH_PROTOCOL.md](RESEARCH_PROTOCOL.md)]。
 
 ---
 
-## 1. 演示契约（冻结）
+## 1. 测量契约（冻结 2026-10-15，B0）
 
-| 项 | 值 |
-|----|-----|
-| 代号 | `demo-hs300-20d-top20-1y` |
-| 股票池 | `hs300`（`stock_scores.index_codes`） |
-| 基线轨 **A** | `composite_growth_cycle_score`，`growth_cycle_weights=60:40`（与 `entry_filter_mvp_spec` / 组合研究默认一致；上线前与组合计划核对） |
-| 模型轨 **B** | `model_id` 默认 `promo-hs300-2bc005de`（`source_job_id` 与 Shadow profile 一致，可 CLI 覆盖） |
-| 选股 | **TOP 20**，`selection_mode=fixed_top_n`，**等权** |
-| 调仓 | **每 20 个交易日**；信号日 **T**（收盘后可知）；成交 **T+1 开盘** |
-| 成本 | 单边 **10 bps**（`transaction_cost=0.001` 往返口径与 ScoreBacktester 对齐） |
-| 窗口 | **默认最近 252 个交易日**（约 1 年）；CLI `--years 2` → 504 交易日 |
-| 结束日 | 基线：`max(score_date)`（hs300）；模型：与 A 调仓日交集 |
-| 标签/持有 | 训练标签 20 日；演示调仓 20 日 → **持有期与协议一致** |
+> 本节参数已于 2026-10-15 逐条对**生产实况**核实，出处见 §1.3；与 draft 版不符处已就地更正。
+> 契约只定义「测量什么、按什么口径算」，实现进度见 §5。
+
+| 项 | 值 | 依据 |
+|----|-----|------|
+| 股票池 | `hs300`，取 `finance.stock_scores` 的**当日** `index_codes` 成员（天然 as-of，不用固定名单） | 实盘 plan `live_trading_default` |
+| 基线轨 **A** | **自算** `0.6 × growth_score + 0.4 × cycle_score`（可用权重归一；缺一维则取另一维） | 实盘 `score_type=growth_cycle_weighted`，`growth_weight=0.6` / `cycle_weight=0.4` |
+| 模型轨 **B** | `model_id` 由 Shadow 登记提供，CLI 可覆盖；backfill 段用**晋升 job 的配方**（从 `model_training_jobs` 读，不手抄） | — |
+| 选股 | TOP **N**，`selection_mode=fixed_top_n`，**等权** | — |
+| N（主/敏感） | 主 **N=10**（与实盘一致）；**N=20** 作敏感性 | 实盘 `top_n=10` |
+| 调仓（主/敏感） | 主 **20 交易日**（与标签 horizon 一致）；**30 交易日**（与实盘一致）作敏感性 | 标签 `LABEL_HORIZON_DAYS=20`；实盘 `rebalance_days=30` |
+| 成交 | 信号日 **T**（收盘后可知）→ **T+1 开盘** | 协议 `execution_price=next_open` |
+| 成本 | **费用 + 滑点**两项，口径见 §1.2（**不再**写作「单边 10 bps」） | 协议 + `alpha_factor_backtest.CostAssumptions` |
+| 标签 | `label_fwd_20d` = 池内 **demean** 后的超额，不是原始收益 | `dataset/labels.py::attach_label_column` 默认 `neutralize="demean"` |
+| 训练/评估切分 | **purge ≥ 60 交易日**，复用 `evaluation/walk_forward.py` | 协议 `MAX_PURGE_DAYS=60` |
+| 主指标 | 扣成本后**中性化 IC / rank-IC**、TOP-K 相对池等权的**逐日**超额 | 协议「成本」「模型晋级」两节 |
+| 次指标 | 净值、回撤、换手 —— **仅作沟通**，须标注独立期数（n≈12/年）无统计功效 | — |
+| 对照轨 | **R**：随机分数，相对池等权超额应 ≈ 0（否则 harness 有泄漏或记账错） | 协议置换检验 |
+| 窗口 | 默认 **504 交易日（2 年）**，另支持 `start/end` 显式区间 | — |
+| 结束日 | 基线：`max(score_date)`（hs300）；模型：与 A 调仓日交集 | — |
+
+**指标优先级**：主证据是 IC / top-K 逐日超额（约 250 日 × 300 名 ≈ 7.5 万观测，有功效）；净值差只能作为**同名调仓日配对**的统计量，附置换/bootstrap p 值。1 年窗口的净值差**不足以**支持任何「模型更好」的结论。
+
+**调仓周期与标签的错配**：标签 horizon 是 20 日，实盘调仓是 30 日。主口径取 20 日（与标签一致），30 日作为「实盘会拿到什么」的敏感性 —— 若 20 日口径都赢不了，30 日不必看。
 
 ### 1.1 模型分来源（B 轨）
 
 | 区间 | 来源 | Mongo 标记 |
 |------|------|------------|
-| Shadow 日更上线日起 | `model_predictions`（`shadow: true`） | `score_source=shadow_live` |
-| 更早调仓日 | **Backfill 模拟**（见 §4） | `score_source=backfill_pit` 或单独 collection |
+| `shadow_live_from` 之后 | `model_predictions`（`shadow: true`） | `score_source=shadow_live` |
+| 更早调仓日 | **PIT backfill**（见 §4），按协议 purge=60 | `score_source=backfill_pit` |
+
+**边界按日期切，不按「当天有没有分」切** —— 半覆盖的截面不得当完整截面用。
 
 **禁止**：用「全历史 Parquet 一次 refit」给所有过去 T 打分（未来信息泄漏）。  
-Forward **8–12 周 Shadow 观察**仍只认 `shadow_live` 段，不能用 backfill 冒充。
+Forward **8–12 周 Shadow 观察**仍只认 `shadow_live` 段，不能用 backfill 冒充。  
+**可测替代**：在 Shadow 与 backfill 重叠的调仓日做 rank correlation —— 复现得好，长曲线才可信（§5 B3）。
+
+### 1.2 成本口径（2026-10-15 核实）
+
+仓库现存 **4 套**口径，draft 的「单边 10 bps」不属于其中任何一套：
+
+| 口径 | 出处 | 一次 100% 换手的成本 |
+|------|------|----------------------|
+| 协议（只定义滑点） | `protocol.DEFAULT_SLIPPAGE_BPS=10`（单边） | 滑点往返 20 bps，**未含费用** |
+| 因子回测（唯一完整实现） | `alpha_factor_backtest.CostAssumptions.round_trip_rate()` | 费用 7 bps + 滑点 20 bps = **27 bps** |
+| 组合回测 / 实盘 plan（legacy） | `trade_fee_model.period_cost_rate` + `transaction_cost=0.001` | **10 bps**，且**不含滑点** |
+| 组合回测（显式费率预设） | 买 1bp + 卖 1bp + 印花税 5bp | **7 bps**（此时 `transaction_cost` 被 `from_params` **忽略**） |
+| draft 的 `demo/portfolio.py` | `ONE_WAY_COST=0.001` × 2 侧 | 20 bps |
+
+**采用**：`费用（往返 7 bps）+ 单边滑点 10 bps` = 一次全换手 **27 bps**，即 `alpha_factor_backtest` 的口径 —— 它是唯一同时落地了协议滑点常量与真实费率的地方，且对高换手轨偏保守（模型轨换手通常更高，成本从宽更不容易自欺）。
+
+`ScoreBacktester` **没有任何成本字段**（纯 gross 输出），draft 里「与 ScoreBacktester 对齐」的说法作废。
+
+### 1.3 口径来源（核实记录）
+
+- **实盘参数**：`quant_trading.portfolio_trade_plans` 最新 plan（`preset_id=live_trading_default`，`params_hash=7cd2a2143a5f`）—— hs300 / 60:40 / `top_n=10` / `rebalance_days=30` / `execution_price=next_open` / `transaction_cost=0.001`。
+- **预置对照**：`portfolio_strategy_param_presets` 共 6 条，研究面多为 10 日调仓，`growth_cycle_index_enhanced_csi1000_top10_20d` 为 20 日。
+- **`finance.stock_scores` 没有 `composite_growth_cycle_score` 列**（实际字段：`composite_score` / `growth_score` / `cycle_score` / `technical_score` / `value_score` / `fundamental_score` / `money_flow_score` …）⇒ A 轨必须自算加权；doc 原稿「优先读存储列」在生产恒为死分支。
+- **成本语义**：`analysis/core/trade_fee_model.py::from_params` / `period_cost_rate`；`portfolio_backtester` 与 `score_backtester` **均不含滑点**。
+- **数据可得性**：本地 `finance.stock_scores` 656 万条、hs300 日更至 20261014 ✅；本地 `quant_ml` **为空**（`model_training_jobs` / `model_predictions` / `dataset_manifests` 全 0，`MODEL_SHADOW_PROFILES` 未设），ML 侧数据在远端（K8s/VOLC）Mongo —— B 轨读数通道须在 B3 前确认。
 
 ---
 
@@ -39,113 +79,80 @@ Forward **8–12 周 Shadow 观察**仍只认 `shadow_live` 段，不能用 back
 | 交付 | 说明 |
 |------|------|
 | CLI | `python -m quant_model_platform.tools.demo_hs300_20d_top20` |
-| 输出目录 | `--out-dir`：`summary.json`、`equity_curve.csv`、`rebalances.csv`、`metadata.json` |
+| 输出目录 | `--out-dir` **现有**：`summary.json`、`equity_curve.csv`、`rebalances.csv`；**计划**：`metrics_by_date.csv`（逐日主指标，B2）、`metadata.json`（provenance，B4） |
 | 文档 | 本文件 + RUNBOOK 一节「Demo 回测」 |
-| 可选 API | `GET /api/model-training/demos/hs300-20d-top20`（Phase D3） |
-| 可选 UI | 训练域 Tab「相对成长周期 TOP20」（Phase D3） |
+| 后续（可选） | `GET /api/model-training/demos/...` + 训练域 Tab（API/UI，非 MVP） |
 
-### 2.1 `summary.json`（示例字段）
+### 2.1 `summary.json`（目标字段）
 
 ```json
 {
-  "demo_id": "demo-hs300-20d-top20-1y",
-  "window": {"start": "YYYYMMDD", "end": "YYYYMMDD", "trading_days": 252},
-  "rebalance_days": 20,
-  "top_n": 20,
-  "track_a": {"score_column": "composite_growth_cycle_score", "total_return": 0.0, "max_drawdown": 0.0, "ann_vol": 0.0, "avg_turnover": 0.0},
-  "track_b": {"model_id": "promo-hs300-2bc005de", "total_return": 0.0, "max_drawdown": 0.0, "shadow_live_from": "YYYYMMDD"},
-  "comparison": {"excess_return_b_minus_a": 0.0, "avg_overlap_ratio": 0.0},
-  "caveats": ["backfill_pit_before=..."]
+  "demo_id": "demo-hs300-gc-vs-model",
+  "contract": {"frozen": "2026-10-15", "purge_days": 60, "label_neutralize": "demean",
+               "cost_round_trip_bps": 27, "execution_price": "next_open"},
+  "window": {"start": "YYYYMMDD", "end": "YYYYMMDD", "trading_days": 504},
+  "params": {"universe": "hs300", "top_n": 10, "rebalance_days": 20, "growth_cycle": "60:40"},
+  "primary": {"rank_ic_mean": 0.0, "rank_ic_ir": 0.0, "topk_excess_mean_bps": 0.0,
+              "paired_p_value": null, "periods": 0},
+  "track_a": {"label": "规则分 60:40"},
+  "track_b": {"model_id": "...", "shadow_live_from": "YYYYMMDD", "scored_days": {"shadow_live": 0, "backfill_pit": 0}},
+  "control_r": {"topk_excess_mean_bps": 0.0},
+  "nav": {"total_return_a": 0.0, "total_return_b": 0.0, "max_drawdown_grid": 0.0,
+          "note": "调仓网格口径，非日频；n 小、无统计功效"},
+  "backfill_validation": {"overlap_days": 0, "rank_corr_vs_shadow": null},
+  "provenance": {"code_sha": "", "panel_snapshot_id": "", "source_job_id": ""},
+  "caveats": []
 }
 ```
 
+净值字段保留，但报告与 UI 必须**先展示主指标**，并在净值旁标注口径与功效限制。
+
 ---
 
-## 3. 架构
+## 3. 架构与运行位置
 
 ```text
                     ┌─────────────────────────────────────┐
                     │  demo_hs300_20d_top20.py            │
                     └─────────────────────────────────────┘
-           ┌────────────────┬────────────────┬──────────────────┐
-           ▼                ▼                ▼                  ▼
-   rebalance calendar   Track A scores    Track B scores    ScoreBacktester
-   (20d grid)          stock_scores      shadow + backfill  (stock-scoring-system)
-                       Mongo finance     Mongo quant_ml
+        ┌───────────────┬────────────────┬──────────────────┐
+        ▼               ▼                ▼                  ▼
+  rebalance grid   Track A 自算      Track B 读数      metrics + NAV
+  (20d / 30d)      finance.stock_    quant_ml          IC / top-K 超额
+                   scores(本地✅)     (远端❓)           + 成本 + 配对统计
 ```
 
-- **回测引擎**：优先复用 `stock-scoring-system/analysis/core/score_backtester.py`（`BacktestConfig` + `ScoreBacktester`），避免自写收益公式。
-- **编排仓库**：`quant-model-platform`（CLI、读 `quant_ml`、调 backfill）；对 `stock-scoring-system` 为 **可选依赖**（同 monorepo 路径或 `PYTHONPATH`）。
+- **运行位置**：开发机 / aipoc（本机可读 `finance`，ML 数据通道见 §1.3）。
+- **`stock-scoring-system` 不作运行时依赖**：trainer 镜像只含本仓，装不进去。它只作**对账基准**（gross、as-of universe）。它的 forward return 带 `exit_limit_delay_days` / 止损 / regime 分支，把这些拉进 demo 会让「差异来自模型」这个结论不可解释。
+- **A 轨数据**：本地 `finance.stock_scores`，按 `score_date` 取当日 hs300 成员。
+- **B 轨数据**：`quant_ml.model_predictions`；本机为空，B3 前确认远端通道或改为在远端跑。
 
 ---
 
 ## 4. Backfill（B 轨历史段）
 
-对每个调仓日 **T**（仅当无 `shadow_live` 分或 `--force-backfill`）：
+对每个调仓日 **T**（仅当该日无 `shadow_live` 分，或显式 `--force-backfill`）：
 
-1. 从 Mongo 拉 hs300、`score_date <= T` 的 `stock_scores` + 价量，拼 **PIT 面板**（或物化到临时 Parquet，`end_date=T`）。
-2. 用 **晋升 job 配方**（`model_kind`、`feature_names`、`model_params`）在 `label` 可算样本上 **refit**（仅用 `trade_date` 行且标签基于 ≤T 的信息；与 `fit_full_sample` 相同但 **面板截断到 T**）。
-3. 对 **当日截面** `trade_date=T` 预测 → 写入内存或 `model_predictions` 辅助表（`source=backfill_pit`）。
-4. **不调仓日**不算分（仅 ~12 次/年 refit，性能可接受）。
+1. 从 `finance.stock_scores` + 价量拼 **PIT 面板**（`trade_date <= T`），或复用物化 Parquet 后截断到 T。
+2. 取**晋升 job 的配方**（`model_kind` / `feature_names` / `model_params`，从 `model_training_jobs` 读），在可算标签的样本上 refit：面板截断到 T，且训练窗末再退 **purge = 60 交易日**（协议 `MAX_PURGE_DAYS`，复用 `evaluation/walk_forward.py` 的口径，勿自写）。
+3. 对**当日截面** `trade_date = T` 预测，标记 `score_source=backfill_pit`。
+4. **非调仓日不算分**（≈12 次 refit/年 × 池数）。
 
-可选优化（Phase D1.5）：缓存「截至 T 的 refit 系数」按周增量；非 MVP 必须。
+**重叠期校验（必做）**：在 Shadow 与 backfill 都有的调仓日，比较两边分数的 rank correlation。复现不好 ⇒ 长曲线不可用于任何结论，只能当管道验证。
 
 ---
 
-## 5. 开发阶段
+## 5. 实施批次
 
-### Phase D0 — 前置（约 2–3 天）
+| 批次 | 内容 | 规模 | 验收 |
+|------|------|------|------|
+| **B0** | 冻结本契约（本节 §1）；修 doc 内的失实表述 | 0.5d | 本文件 |
+| **B1** | 修 demo 记账 bug：缺失截面=持仓不变且不计换手（区分「无截面」与「前瞻未完成」）、末段不完整期剔出 NAV、`--score-column` 真正生效、`--years` 不足时明确报错；清死代码 | 1d | 单测 + 对照轨 R 相对池等权超额 ≈ 0 |
+| **B2** | A 轨端到端：读 `stock_scores`（as-of 成员）→ 20 日调仓 → 主指标 + 净值；与 `ScoreBacktester.calculate_topk_summary` 同参逐日对账 | 1d | `top_vs_universe` / `universe_mean_return` 逐日一致 |
+| **B3** | B 轨：`shadow_live_from` 日期切片；backfill 换成协议口径（purge=60 + job 配方）；重叠期 rank correlation | 1.5d | 重叠期相关性达标；`quant_ml` 读数通道确认 |
+| **B4** | 池参数化（hs300 / a500 / csi1000）、窗口 `start/end`、`metadata.json` provenance、与 `process_portfolio_research_jobs` 交叉校验 | 1.5d | 两条链路 A 轨一致 |
 
-| ID | 任务 | 负责人/仓 | 验收 |
-|----|------|-----------|------|
-| D0.1 | 确认实盘 `score_column`、`top_n`（10 vs 20）、`growth_cycle_weights` | 业务 + 组合计划 | 写入本 doc §1 脚注 |
-| D0.2 | Phase 1.5 pipeline 部署（20:00） | infra | `hs300-current.end_date` 跟进 scorer |
-| D0.3 | 拉 1 年 hs300 `score_date` 覆盖报告（缺失日列表） | 脚本/手工 | 调仓日 A 轨缺失 <5% |
-| D0.4 | 记录 Shadow live 起始日 `shadow_live_from` | 运维 | 写入 `metadata.json` |
-
-### Phase D1 — CLI 核心（约 1.5–2 周）
-
-| ID | 任务 | 验收 |
-|----|------|------|
-| D1.1 | `demo/rebalance.py`：生成 20 日调仓日序列（窗口内） | 单元测试：计数 ≈ `floor(N/20)` |
-| D1.2 | `demo/track_a.py`：按日读 `composite_growth_cycle_score`，TOP20 | 与手工 Mongo 查询一致 1 日 |
-| D1.3 | `demo/track_b.py`：优先读 `model_predictions`；缺失走 backfill §4 | 标记 `score_source` |
-| D1.4 | `demo/backfill_pit.py`：截断面板 + refit + 预测单日 | 测试：T 早于训练窗末无未来列 |
-| D1.5 | 对接 `ScoreBacktester`（同等权、20d、成本） | 与 `entry_filter_mvp` 同窗 A 轨误差 <1e-6 |
-| D1.6 | CLI + `summary.json` / CSV 输出 | `pytest tests/test_demo_hs300_20d_top20.py` |
-| D1.7 | `--years 1|2`、`--model-id`、`--source-job-id`、`--out-dir` | 文档 `--help` |
-
-**M1 里程碑**：一条命令产出 1 年 A/B 对比表 + 回撤。
-
-### Phase D1.5 — 性能与缓存（可选，约 3 天）
-
-| ID | 任务 |
-|----|------|
-| D1.5.1 | Backfill 并行按调仓日（进程池 ≤4） |
-| D1.5.2 | 可选：backfill 结果写入 `quant_ml.model_predictions_backfill` 避免重复算 |
-
-### Phase D2 — 策略对齐与消融（约 3–5 天）
-
-| ID | 任务 |
-|----|------|
-| D2.1 | 第三轨 **C**：仅 growth+cycle 60:40 手算列（与 A 应一致，回归测试） |
-| D2.2 | 与 `process_portfolio_research_jobs` 同参数跑 1 条研究 job，对比 A 轨净值 |
-| D2.3 | `metadata.json` 自动写 caveat（backfill 区间、shadow_live 区间） |
-
-### Phase D3 — API + UI（约 1 周，可延后）
-
-| ID | 任务 | 仓 |
-|----|------|-----|
-| D3.1 | `GET .../demos/hs300-20d-top20?years=1` 触发或读缓存 | quantFinance |
-| D3.2 | 训练页 Tab：双净值、回撤、重叠率表 | dashboard |
-| D3.3 | 链接 `promotion-context` + `source_job_id` | dashboard |
-
-### Phase D4 — 组合研究统一入口（可选）
-
-| ID | 任务 |
-|----|------|
-| D4.1 | 研究 Job 模板：hs300、20d、TOP20、`MODEL_SCORE_ADAPTER` |
-| D4.2 | 与 D1 净值交叉校验 |
+后续（非 MVP）：API + UI；`MODEL_SCORE_ADAPTER` 走查；日频 NAV 与日频回撤。
 
 ---
 
@@ -153,55 +160,49 @@ Forward **8–12 周 Shadow 观察**仍只认 `shadow_live` 段，不能用 back
 
 | 层级 | 内容 |
 |------|------|
-| 单元 | 调仓日历；单日 TOP20；backfill 截断无泄漏（合成小面板） |
-| 集成 | Mem Mongo fixture；1 个调仓日 A/B 分数 |
-| 回归 | A 轨与 ScoreBacktester 直接调用同参数 |
-| 手工 | aipoc 跑 1 年，`summary.json` 人工 spot-check 3 个调仓日持仓 |
+| 单元 | 调仓日历；单日 TOP-N；缺失截面语义；末段完整期判定；purge 断言（训练窗末 ≤ T − 80 交易日，horizon 20 + purge 60） |
+| 集成 | 合成小面板跑通 A/B/R 三轨；`--bundle` 离线夹具 |
+| 对账 | A 轨与 `ScoreBacktester` 同参数逐日一致（B2） |
+| **harness 自证** | **对照轨 R 相对池等权超额 ≈ 0**；可选泄漏探针（把 T 日分数换成 T+1 日分数，harness 应显著变好） |
+| 手工 | aipoc 跑全窗口，`summary.json` 人工 spot-check 3 个调仓日持仓 |
 
 ---
 
-## 7. 排期（示意）
-
-| 周 | 目标 |
-|----|------|
-| W1 | D0 + D1.1–D1.3 |
-| W2 | D1.4–D1.7，**M1** 内部分享 |
-| W3 | D2；可选 D3 启动 |
-| W4+ | D3 上线；D4 按需 |
-
----
-
-## 8. 风险
+## 7. 风险
 
 | 风险 | 缓解 |
 |------|------|
-| Backfill 慢（12× refit/年） | 仅调仓日；D1.5 并行 |
-| A 轨 `composite_growth_cycle` 与实盘权重不一致 | D0.1 核对 |
-| 用户误解 backfill = Shadow 已满 1 年 | UI/报告强制展示 `shadow_live_from` |
-| `stock-scoring-system` 导入重 | 子进程 CLI 或薄封装 HTTP 调 researcher |
+| 12 期/年的净值差被当结论 | 报告以主指标打头；净值旁强制标注期数与功效 |
+| Backfill 与 Shadow 分布不一致 | 重叠期 rank correlation 校验；不达标则长曲线只作管道验证 |
+| 成本口径分歧（4 套并存） | §1.2 写死采用「费用 + 单边滑点」，并在 summary 里回显常量 |
+| B 轨数据在远端 Mongo | B3 前确认通道；否则 A 轨与 harness 先落地，B 轨延后 |
+| 训练标签（20d demean 超额）与实盘调仓（30d）错配 | 主口径 20d；30d 只作敏感性并标注错配 |
+| `--years` 数据不足被静默降级 | B1 起改为显式报错 / 明确 warn |
 
 ---
 
-## 9. CLI 草案
+## 8. CLI 草案
 
 ```bash
 python -m quant_model_platform.tools.demo_hs300_20d_top20 \
-  --years 1 \
-  --top-n 20 \
+  --universe hs300 \
+  --start 20241001 --end 20261014 \
+  --top-n 10 \
   --rebalance-days 20 \
-  --score-column composite_growth_cycle_score \
   --growth-cycle-weights 60:40 \
   --model-id promo-hs300-2bc005de \
-  --source-job-id 2bc005de-1ca1-4146-bd03-1e19fc31abfd \
-  --out-dir /tmp/demo-hs300-1y
+  --source-job-id <从 model_training_jobs 读，勿手抄> \
+  --control-track random \
+  --out-dir /tmp/demo-hs300
 ```
 
-环境：`MONGO_URI`、`MONGO_DB`、`QUANT_ML_DB`、S3（若 backfill 走 Parquet）。
+环境：`MONGO_URI`（`finance`）、`QUANT_ML_DB`、远端 ML Mongo 通道（待定）。
 
 ---
 
-## 10. 未决（实施前确认）
+## 9. 待拍板
 
-- [ ] 实盘 TOP **10** 还是 **20**（demo 默认 20，可 `--top-n 10`）
-- [ ] `growth_cycle_weights` 是否全策略统一 60:40
-- [ ] Backfill 是否持久化到 Mongo 或仅 demo 本地 CSV
+- [ ] 主口径 **N=10 / 调仓 20d** 是否认可（原稿为 TOP20 / 20d；实盘是 TOP10 / 30d）
+- [ ] `demo_id` 是否改名去 N（现名 `demo-hs300-20d-top20-1y` 与主口径不符）
+- [ ] B 轨读数：接远端 Mongo，还是把 demo 放到远端跑
+- [ ] 默认窗口 2 年是否够（长期计划下是否需要全窗口 2020–2026）
