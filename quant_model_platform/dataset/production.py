@@ -15,6 +15,11 @@ from quant_model_platform.config import PlatformConfig
 from quant_model_platform.dataset.features import add_missing_flags, registry_names
 from quant_model_platform.dataset.labels import attach_label_column
 from quant_model_platform.dataset.manifest import build_manifest, write_parquet_snapshot
+from quant_model_platform.dataset.raw_factors import (
+    WARMUP_OBSERVATIONS,
+    derive_daily_basic_factors,
+    derive_price_factors,
+)
 
 log = logging.getLogger(__name__)
 
@@ -25,10 +30,30 @@ _SCORE_FIELD_MAP = {
     "quality_score": "fundamental_score",
 }
 
-_PRICE_PROJECTION = {"_id": 0, "symbol": 1, "trade_date": 1, "open": 1}
+#: Adjusted price columns the panel needs: ``open`` for the label, ``close``
+#: for the trailing raw factors.
+_PRICE_COLUMNS = ("open", "close")
+_PRICE_PROJECTION = {"_id": 0, "symbol": 1, "trade_date": 1, "open": 1, "close": 1}
 _ADJ_FACTOR_COLLECTION = "stock_adj_factor"
 _ADJ_FACTOR_PROJECTION = {"_id": 0, "symbol": 1, "trade_date": 1, "adj_factor": 1}
+_DAILY_BASIC_COLLECTION = "financial_daily_basic"
+_DAILY_BASIC_PROJECTION = {
+    "_id": 0,
+    "ts_code": 1,
+    "trade_date": 1,
+    "circ_mv": 1,
+    "turnover_rate": 1,
+}
 _SYMBOL_CHUNK = 250
+
+#: Panel join key. ``trade_date`` is the normalized ``score_date``; ``ts_code``
+#: is whichever of ``symbol`` / ``ts_code`` the source collection stores.
+_JOIN_KEYS = ("trade_date", "ts_code")
+
+#: Calendar days of price history loaded before ``start_date`` so that a
+#: 60-session window is already full on the panel's first day. 60 sessions is
+#: roughly 87 calendar days; 130 leaves room for holidays and suspensions.
+_WARMUP_CALENDAR_DAYS = 130
 
 
 def _normalize_trade_date(value: Any) -> Optional[str]:
@@ -184,14 +209,18 @@ def _apply_adj_factor(
     data_db_name: str,
     start_date: str,
     end_date: str,
+    columns: Sequence[str] = ("open",),
 ) -> pd.DataFrame:
-    """Multiply opens by the forward-adjustment factor.
+    """Multiply price columns by the forward-adjustment factor.
 
-    ``volume_price.open`` is the raw traded price, so a split or a dividend
-    inside a forward window reads as a huge fake return. Every label and
-    backtest here is a ratio of two opens, so any single multiplicative basis
-    gives the same return; hfq (``open * adj_factor``) matches what
+    ``volume_price`` holds raw traded prices, so a split or a dividend inside
+    a forward window reads as a huge fake return. Every label and backtest
+    here is a ratio of two prices, so any single multiplicative basis gives
+    the same return; hfq (``price * adj_factor``) matches what
     ``ScoreBacktester`` uses via ``adjust="hfq"``.
+
+    ``close`` needs the same treatment as ``open``: a momentum computed off raw
+    closes rediscovers the ``add8d17`` bug on the factor side.
     """
     factors = _load_adj_factors(
         client,
@@ -205,16 +234,18 @@ def _apply_adj_factor(
     missing = out["adj_factor"].isna()
     if missing.any():
         log.warning(
-            "no adj_factor for %d/%d price rows (%.3f%%); those opens stay unadjusted",
+            "no adj_factor for %d/%d price rows (%.3f%%); those prices stay unadjusted",
             int(missing.sum()),
             len(out),
             100.0 * float(missing.mean()),
         )
-    out["open"] = out["open"] * out["adj_factor"].fillna(1.0)
+    basis = out["adj_factor"].fillna(1.0)
+    for column in columns:
+        out[column] = out[column] * basis
     return out.drop(columns=["adj_factor"])
 
 
-def load_open_prices(
+def load_price_history(
     client: MongoClient,
     *,
     data_db_name: str,
@@ -222,11 +253,12 @@ def load_open_prices(
     start_date: str,
     end_date: str,
 ) -> pd.DataFrame:
-    """Forward-adjusted opens, one row per (trade_date, ts_code)."""
+    """Forward-adjusted opens and closes, one row per (trade_date, ts_code)."""
+    empty = pd.DataFrame(columns=["trade_date", "ts_code", *_PRICE_COLUMNS])
     start = _normalize_trade_date(start_date)
     end = _extend_end_calendar(_normalize_trade_date(end_date) or end_date)
     if not start or not end:
-        return pd.DataFrame(columns=["trade_date", "ts_code", "open"])
+        return empty
     coll = client[data_db_name]["volume_price"]
     unique = sorted({s for s in symbols if s})
     chunks: List[pd.DataFrame] = []
@@ -237,16 +269,104 @@ def load_open_prices(
         if not part.empty:
             chunks.append(part)
     if not chunks:
-        return pd.DataFrame(columns=["trade_date", "ts_code", "open"])
+        return empty
     frame = pd.concat(chunks, ignore_index=True)
     frame["trade_date"] = frame["trade_date"].map(_normalize_trade_date)
     frame["ts_code"] = frame["symbol"].astype(str)
-    frame["open"] = pd.to_numeric(frame["open"], errors="coerce")
+    for column in _PRICE_COLUMNS:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame = frame.dropna(subset=["trade_date", "ts_code", "open"])
     frame = _apply_adj_factor(
-        client, frame, data_db_name=data_db_name, start_date=start, end_date=end
+        client,
+        frame,
+        data_db_name=data_db_name,
+        start_date=start,
+        end_date=end,
+        columns=_PRICE_COLUMNS,
     )
-    return frame[["trade_date", "ts_code", "open"]]
+    return frame[["trade_date", "ts_code", *_PRICE_COLUMNS]]
+
+
+def load_daily_basic(
+    client: MongoClient,
+    *,
+    data_db_name: str,
+    symbols: Sequence[str],
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """Daily total/circulating market cap and turnover, per (trade_date, ts_code).
+
+    ``quant_data.financial_daily_basic`` is indexed on ``ts_code``, not
+    ``symbol`` -- querying it by symbol full-scans ~14M rows, so the symbol set
+    is matched against ``ts_code`` directly. Both sides store the suffixed form
+    (``600000.SH``), the same as ``volume_price.symbol``.
+    """
+    empty = pd.DataFrame(columns=["trade_date", "ts_code", "circ_mv", "turnover_rate"])
+    start = _normalize_trade_date(start_date)
+    end = _extend_end_calendar(_normalize_trade_date(end_date) or end_date)
+    if not start or not end:
+        return empty
+    coll = client[data_db_name][_DAILY_BASIC_COLLECTION]
+    unique = sorted({s for s in symbols if s})
+    chunks: List[pd.DataFrame] = []
+    for i in range(0, len(unique), _SYMBOL_CHUNK):
+        batch = unique[i : i + _SYMBOL_CHUNK]
+        query = {"ts_code": {"$in": batch}, "trade_date": {"$gte": start, "$lte": end}}
+        part = pd.DataFrame(list(coll.find(query, _DAILY_BASIC_PROJECTION)))
+        if not part.empty:
+            chunks.append(part)
+    if not chunks:
+        return empty
+    frame = pd.concat(chunks, ignore_index=True)
+    frame["trade_date"] = frame["trade_date"].map(_normalize_trade_date)
+    frame["ts_code"] = frame["ts_code"].astype(str)
+    frame = frame.dropna(subset=["trade_date", "ts_code"])
+    # A duplicated key would fan the merge out and double-count rows. The score
+    # loader skips this and gets away with it; a new source should not copy that.
+    return frame.drop_duplicates(subset=["trade_date", "ts_code"], keep="last")
+
+
+def _attach_raw_factors(
+    client: MongoClient,
+    panel: pd.DataFrame,
+    prices: pd.DataFrame,
+    *,
+    data_db_name: str,
+    symbols: Sequence[str],
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """Left-join the price and daily-basic factors onto the panel.
+
+    Each join is checked for fan-out: a duplicated key on either side would
+    multiply panel rows, and every count downstream would still look plausible.
+    """
+    basic = load_daily_basic(
+        client,
+        data_db_name=data_db_name,
+        symbols=symbols,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    derived = (derive_price_factors(prices), derive_daily_basic_factors(basic))
+
+    out = panel
+    for factors in derived:
+        if factors.empty:
+            continue
+        # The registry pre-creates every declared name as NaN; merging onto a
+        # column that already exists would produce momentum_20d_x/_y instead.
+        overlap = [c for c in factors.columns if c in out.columns and c not in _JOIN_KEYS]
+        if overlap:
+            out = out.drop(columns=overlap)
+        before = len(out)
+        out = out.merge(factors, on=list(_JOIN_KEYS), how="left")
+        if len(out) != before:
+            raise RuntimeError(
+                f"raw factor join fanned the panel out: {before} -> {len(out)} rows"
+            )
+    return out
 
 
 def build_production_panel(
@@ -281,25 +401,47 @@ def build_production_panel(
         for name in feature_names:
             if name not in panel.columns:
                 panel[name] = float("nan")
-        panel = add_missing_flags(panel, feature_names)
         symbols = panel["ts_code"].unique().tolist()
-        prices = load_open_prices(
+
+        # Prices load from before the panel starts, so a 60-session window is
+        # already full on the first signal date. The extra leading rows match no
+        # panel row and drop out at the join; a forward-shifted label is
+        # unaffected by history that precedes it.
+        warmup_start = _extend_start_calendar(start_date, extra_days=_WARMUP_CALENDAR_DAYS)
+        prices = load_price_history(
             mongo,
             data_db_name=cfg.data_db_name,
             symbols=symbols,
-            start_date=start_date,
+            start_date=warmup_start,
             end_date=end_date,
         )
         if prices.empty:
             raise RuntimeError(f"no volume_price rows in {cfg.data_db_name} for panel symbols")
         panel = attach_label_column(panel, prices)
+        panel = _attach_raw_factors(
+            mongo,
+            panel,
+            prices,
+            data_db_name=cfg.data_db_name,
+            symbols=symbols,
+            start_date=warmup_start,
+            end_date=end_date,
+        )
+        # After the factors, not before: flags computed against the NaN
+        # placeholders would call every raw factor missing on every row.
+        panel = add_missing_flags(panel, feature_names)
         parquet_dir.mkdir(parents=True, exist_ok=True)
         if use_canonical_snapshot:
             path = parquet_dir / f"{index_code}_current.parquet"
         else:
             path = parquet_dir / f"{index_code}_production_{start_date}_{end_date}.parquet"
         write_parquet_snapshot(panel, path)
-        source_revision = f"stock_scores:{cfg.mongo_db}:{index_code}:{start_date}-{end_date}"
+        # The suffix separates snapshots that share a window but not a feature
+        # set. Without it, provenance for the raw-factor panel would read
+        # identically to the scores-only one it replaced.
+        source_revision = (
+            f"stock_scores:{cfg.mongo_db}:{index_code}:{start_date}-{end_date}:rawfactors-v1"
+        )
         manifest = build_manifest(
             panel,
             index_code=index_code,
@@ -326,6 +468,7 @@ def build_production_panel(
 __all__ = [
     "build_production_panel",
     "latest_score_date_for_index",
-    "load_open_prices",
+    "load_daily_basic",
+    "load_price_history",
     "load_stock_score_rows",
 ]

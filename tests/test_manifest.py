@@ -51,6 +51,30 @@ def test_a_partly_filled_feature_reports_its_rate():
     assert docs[1]["populated"] is False
 
 
+def test_a_panel_with_the_raw_factors_reports_them_populated():
+    """The B6a snapshot fills all five; a manifest still saying populated=False
+    would describe the plan rather than the data it was built from."""
+    from quant_model_platform.dataset.raw_factors import RAW_FEATURE_NAMES
+
+    frame = pd.DataFrame({"growth_score": [1.0] * 100})
+    for name in RAW_FEATURE_NAMES:
+        frame[name] = [float("nan")] + [1.0] * 99
+
+    docs = {d["name"]: d for d in registry_document(frame=frame)}
+
+    for name in RAW_FEATURE_NAMES:
+        assert docs[name]["populated"] is True
+        assert docs[name]["fill_rate"] > 0.9
+
+
+def test_turnover_is_declared_against_the_source_it_actually_comes_from():
+    """It is a 20-day mean of financial_daily_basic.turnover_rate, not a price."""
+    docs = {d["name"]: d for d in registry_document()}
+
+    assert docs["turnover_20d"]["source"] == "fundamentals"
+    assert docs["momentum_20d"]["source"] == "prices"
+
+
 def test_manifest_carries_the_population_of_its_own_frame(tmp_path: Path):
     frame = pd.DataFrame({"growth_score": [1.0, 2.0], "value_score": [None, None]})
     path = tmp_path / "panel.parquet"

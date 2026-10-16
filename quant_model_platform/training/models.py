@@ -27,15 +27,31 @@ class TrainedModel:
     params: Dict[str, Any]
 
 
+def _feature_columns(frame: pd.DataFrame, feature_names: Sequence[str]) -> List[str]:
+    """Declared names that exist *and* carry data in this frame.
+
+    A column the panel never populated is dropped, not zero-filled: keeping it
+    would make the all-finite mask below unsatisfiable, and filling it would
+    train on a column of constants that no reader can see.
+    """
+    return [c for c in feature_names if c in frame.columns and frame[c].notna().any()]
+
+
 def _feature_matrix(frame: pd.DataFrame, feature_names: Sequence[str]) -> np.ndarray:
-    cols = [c for c in feature_names if c in frame.columns]
-    x = frame[cols].astype(float).fillna(0.0).values
+    """Features as-is, NaNs included.
+
+    Deliberately not imputed here: the callers' ``np.isfinite`` mask is what
+    keeps an incomplete row out of the fit, and filling first made that mask
+    unconditionally true.
+    """
+    cols = _feature_columns(frame, feature_names)
+    x = frame[cols].astype(float).values
     return x, cols
 
 
 def train_rule_baseline(frame: pd.DataFrame, feature_names: Sequence[str], *, weight_col: Optional[str] = None) -> TrainedModel:
     """Equal-weight average of z-scored features (per date)."""
-    names = [n for n in feature_names if n in frame.columns]
+    names = _feature_columns(frame, feature_names)
     return TrainedModel(kind="rule_baseline", feature_names=names, artifact={"method": "equal_zscore_mean"}, params={})
 
 
@@ -62,6 +78,11 @@ def predict_sklearn_linear(frame: pd.DataFrame, model: TrainedModel) -> pd.Serie
     x, _ = _feature_matrix(frame, model.feature_names)
     scaler = model.artifact["scaler"]
     reg = model.artifact["model"]
+    # Scoring is not fitting: a row missing one input still needs a rank, so
+    # impute at the training mean. Post-scaling that is z=0, i.e. the feature
+    # contributes nothing instead of dragging the row to an extreme.
+    if x.size and not np.isfinite(x).all():
+        x = np.where(np.isfinite(x), x, scaler.mean_)
     pred = reg.predict(scaler.transform(x))
     return pd.Series(pred, index=frame.index)
 

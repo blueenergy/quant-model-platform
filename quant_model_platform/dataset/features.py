@@ -19,7 +19,9 @@ class FeatureSpec:
     source: str = "synthetic"
 
 
-# MVP registry: extend without breaking manifest hash when adding at end only.
+# MVP registry. Editing this list changes the manifest content hash either way:
+# content_hash covers which columns the frame carries and the order of the
+# registry entries, so appending is as visible as inserting.
 DEFAULT_FEATURE_REGISTRY: List[FeatureSpec] = [
     FeatureSpec("growth_score", source="stock_scores"),
     FeatureSpec("cycle_score", source="stock_scores"),
@@ -28,7 +30,7 @@ DEFAULT_FEATURE_REGISTRY: List[FeatureSpec] = [
     FeatureSpec("momentum_20d", source="prices"),
     FeatureSpec("momentum_60d", source="prices"),
     FeatureSpec("volatility_20d", source="prices"),
-    FeatureSpec("turnover_20d", source="prices"),
+    FeatureSpec("turnover_20d", source="fundamentals"),
     FeatureSpec("log_market_cap", source="fundamentals"),
     FeatureSpec("pe_ttm", source="fundamentals"),
     FeatureSpec("pb", source="fundamentals"),

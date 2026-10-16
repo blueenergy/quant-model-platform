@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -10,10 +11,15 @@ from scipy import stats
 
 from quant_model_platform.protocol import DEFAULT_SLIPPAGE_BPS
 
+log = logging.getLogger(__name__)
+
 
 #: Fewest usable names a date needs before its IC is reported. Dates below it
 #: yield NaN rather than a correlation off a handful of names.
 MIN_IC_NAMES = 5
+
+#: Fewest usable pairs a date needs before its score is residualized on size.
+MIN_SIZE_SAMPLES = 3
 
 
 def cross_sectional_ic(
@@ -99,6 +105,23 @@ def industry_size_neutralize_scores(
     size_col: str = "log_market_cap",
 ) -> pd.Series:
     """Demean within industry; optional size residualization per date."""
+    # Same trap as the label side: a present-but-empty size column makes this
+    # collapse silently to an industry demean. The size branch reads as enabled
+    # because the production panel declares ``log_market_cap`` long before
+    # anything fills it.
+    if size_col in frame.columns:
+        usable = (frame[score_col].notna() & frame[size_col].notna()).groupby(
+            frame[date_col], sort=False
+        ).sum()
+        thin = int((usable < MIN_SIZE_SAMPLES).sum())
+        if thin:
+            log.warning(
+                "size residualization skipped on %d of %d dates: fewer than %d usable %s samples",
+                thin,
+                int(usable.size),
+                MIN_SIZE_SAMPLES,
+                size_col,
+            )
 
     def _neutral(group: pd.DataFrame) -> pd.Series:
         s = group[score_col].astype(float)
@@ -107,7 +130,7 @@ def industry_size_neutralize_scores(
         if size_col in group.columns:
             x = group[size_col].astype(float)
             mask = s.notna() & x.notna()
-            if mask.sum() >= 3:
+            if mask.sum() >= MIN_SIZE_SAMPLES:
                 coef = np.polyfit(x[mask], s[mask], 1)
                 s = s - (coef[0] * x + coef[1])
         return s - s.mean()
