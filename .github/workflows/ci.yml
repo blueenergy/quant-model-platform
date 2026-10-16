@@ -37,7 +37,7 @@ jobs:
           pytest -q
 
   docker:
-    name: Build & Push Docker image (ghcr.io)
+    name: Build & Push Docker image (ghcr.io + ACR)
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     needs: [test]
@@ -50,6 +50,17 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Push to ACR from here too, not only over the host relay. The runner sits
+      # outside the cross-border link the relay crawls at 50-91 KB/s: it measured
+      # ~6 MB/s (2026-10-16, 150 MB probe), so the 185 MB layer that costs the
+      # relay 45 minutes takes it ~30 s. The relay stays as the fallback and skips
+      # any tag ACR already has.
+      - name: Log in to Aliyun ACR
+        uses: docker/login-action@v3
+        with:
+          registry: crpi-gv3f6mfcrw75qane.cn-hangzhou.personal.cr.aliyuncs.com
+          username: ${{ secrets.ALIYUN_USER }}
+          password: ${{ secrets.ALIYUN_TOKEN }}
       - id: meta
         uses: docker/metadata-action@v5
         with:
@@ -57,6 +68,17 @@ jobs:
           tags: |
             type=sha,prefix=sha-,format=short
             type=raw,value=latest
+      # ACR gets the sha- tag only — the same tag set the relay produces, so this
+      # adds no new pullable name there. `latest` deliberately stays ghcr-only:
+      # docker-compose falls back to `latest` when a *_IMAGE_TAG key is missing
+      # from versions.env, and that fallback has to keep failing loudly instead of
+      # silently running whatever main built last.
+      - id: meta-acr
+        uses: docker/metadata-action@v5
+        with:
+          images: crpi-gv3f6mfcrw75qane.cn-hangzhou.personal.cr.aliyuncs.com/wukongquant/quant-model-trainer
+          tags: |
+            type=sha,prefix=sha-,format=short
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -64,7 +86,9 @@ jobs:
           platforms: linux/amd64
           push: true
           provenance: false
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+            ${{ steps.meta-acr.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
