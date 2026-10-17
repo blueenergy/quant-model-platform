@@ -12,6 +12,10 @@ import pandas as pd
 from pymongo import MongoClient
 
 from quant_model_platform.config import PlatformConfig
+from quant_model_platform.dataset.alt_factors import (
+    load_analyst_revision,
+    load_unlock_overhang,
+)
 from quant_model_platform.dataset.features import add_missing_flags, registry_names
 from quant_model_platform.dataset.labels import attach_label_column
 from quant_model_platform.dataset.manifest import build_manifest, write_parquet_snapshot
@@ -369,6 +373,59 @@ def _attach_raw_factors(
     return out
 
 
+def _attach_alt_factors(
+    client: MongoClient,
+    panel: pd.DataFrame,
+    *,
+    data_db_name: str,
+    symbols: Sequence[str],
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """Left-join the alternative-channel factors (B6e-2) onto the panel.
+
+    Same join discipline as ``_attach_raw_factors``: drop overlapping columns
+    first, then refuse to fan the panel out.
+
+    ``analyst_rev_60d`` stays NaN where a symbol has no analyst coverage; the
+    registry's missing flag carries that. ``unlock_overhang_60d`` is filled
+    with 0.0 after the join: ``share_float`` is market-wide and
+    event-complete back to 2005, so an absent row means "no scheduled
+    unlock", which is a fact about the stock rather than missing data.
+    """
+    out = panel
+    for factors in (
+        load_analyst_revision(
+            client,
+            data_db_name=data_db_name,
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+        ),
+        load_unlock_overhang(
+            client,
+            data_db_name=data_db_name,
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+        ),
+    ):
+        if factors.empty:
+            continue
+        overlap = [c for c in factors.columns if c in out.columns and c not in _JOIN_KEYS]
+        if overlap:
+            out = out.drop(columns=overlap)
+        before = len(out)
+        out = out.merge(factors, on=list(_JOIN_KEYS), how="left")
+        if len(out) != before:
+            raise RuntimeError(
+                f"alt factor join fanned the panel out: {before} -> {len(out)} rows"
+            )
+    if "unlock_overhang_60d" in out.columns:
+        out["unlock_overhang_60d"] = out["unlock_overhang_60d"].fillna(0.0)
+    return out
+
+
 def build_production_panel(
     *,
     index_code: str,
@@ -425,6 +482,16 @@ def build_production_panel(
             data_db_name=cfg.data_db_name,
             symbols=symbols,
             start_date=warmup_start,
+            end_date=end_date,
+        )
+        # Alt-channel loaders carry their own lookback, so they only need the
+        # panel window itself (unlike the price factors above).
+        panel = _attach_alt_factors(
+            mongo,
+            panel,
+            data_db_name=cfg.data_db_name,
+            symbols=symbols,
+            start_date=start_date,
             end_date=end_date,
         )
         # After the factors, not before: flags computed against the NaN

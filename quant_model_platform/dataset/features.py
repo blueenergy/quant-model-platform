@@ -37,6 +37,9 @@ DEFAULT_FEATURE_REGISTRY: List[FeatureSpec] = [
     FeatureSpec("roe", source="fundamentals"),
     FeatureSpec("revenue_yoy", source="fundamentals"),
     FeatureSpec("profit_yoy", source="fundamentals"),
+    # B6e-2 alternative channels (novelty gate 2026-10-17, llm-wiki B6e-1).
+    FeatureSpec("analyst_rev_60d", source="earnings_report_rc"),
+    FeatureSpec("unlock_overhang_60d", source="share_float"),
 ]
 
 
@@ -82,8 +85,9 @@ def registry_document(
     """The feature registry, as a record when ``frame`` is given and a plan otherwise.
 
     ``pit`` is a declared policy about a feature's *source*; it does not mean the
-    snapshot holds the column. Ten of the fourteen entries are never populated by
-    the production path (``dataset/production.py``), so a manifest built without
+    snapshot holds the column. Five of the sixteen entries (``pe_ttm`` / ``pb`` /
+    ``roe`` / ``revenue_yoy`` / ``profit_yoy``) are never populated by the
+    production path (``dataset/production.py``), so a manifest built without
     the frame describes the plan rather than the data. Passing ``frame`` adds the
     observed fill so the two can be read apart.
     """
