@@ -39,7 +39,7 @@ from quant_model_platform.config import PlatformConfig
 from quant_model_platform.dataset.labels import forward_open_to_open_return
 from quant_model_platform.dataset.production import build_production_panel, load_price_history
 from quant_model_platform.evaluation.metrics import spearman_ic, summarize_ic
-from quant_model_platform.evaluation.walk_forward import purged_walk_forward_folds
+from quant_model_platform.evaluation.walk_forward import WalkForwardFold, purged_walk_forward_folds
 from quant_model_platform.training.models import predict_model, train_lightgbm
 
 LABEL_COL = "label_fwd_20d"
@@ -163,6 +163,39 @@ def _attach_factors(panel: pd.DataFrame, factors: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _expanding_folds(
+    dates: Sequence[str],
+    *,
+    min_train_days: int,
+    test_days: int,
+    purge_days: int,
+) -> List[WalkForwardFold]:
+    """Expanding-window folds: every test block trains on all prior history.
+
+    The rolling 60-day window in the main experiment is deliberately short so
+    the A/B fits the existing demo protocol. A higher-power follow-up can use
+    every prior session instead; the first test block then starts after
+    ``min_train_days`` of history plus the purge gap.
+    """
+    ordered = sorted({str(value) for value in dates})
+    folds: List[WalkForwardFold] = []
+    test_start = int(min_train_days) + int(purge_days)
+    fold_id = 0
+    while test_start + int(test_days) <= len(ordered):
+        train_end = test_start - int(purge_days)
+        folds.append(
+            WalkForwardFold(
+                fold_id=fold_id,
+                train_dates=ordered[:train_end],
+                test_dates=ordered[test_start : test_start + int(test_days)],
+                purge_dates=ordered[train_end:test_start],
+            )
+        )
+        fold_id += 1
+        test_start += int(test_days)
+    return folds
+
+
 def _topk_returns(test: pd.DataFrame, k: int) -> Tuple[float, float]:
     """Mean raw return of top-K by prediction, and its excess over the pool."""
     rows: List[Tuple[float, float]] = []
@@ -192,6 +225,8 @@ def _run_pool(
     train_days: int,
     test_days: int,
     purge_days: int,
+    expanding: bool,
+    min_train_days: int,
     top_ks: Sequence[int],
     label_col: str,
     lgb_params: Dict[str, Any],
@@ -227,9 +262,17 @@ def _run_pool(
     panel = _rank_features(panel, present)
 
     dates = sorted(panel["trade_date"].unique())
-    folds = purged_walk_forward_folds(
-        dates, train_days=train_days, test_days=test_days, purge_days=purge_days
-    )
+    if expanding:
+        folds = _expanding_folds(
+            dates,
+            min_train_days=min_train_days,
+            test_days=test_days,
+            purge_days=purge_days,
+        )
+    else:
+        folds = purged_walk_forward_folds(
+            dates, train_days=train_days, test_days=test_days, purge_days=purge_days
+        )
 
     records: List[Dict[str, Any]] = []
     for fold in folds:
@@ -273,6 +316,8 @@ def _run_pool(
         "panel_dates": int(panel["trade_date"].nunique()),
         "panel_symbols": int(panel["ts_code"].nunique()),
         "folds": len(folds),
+        "expanding": expanding,
+        "min_train_days": min_train_days if expanding else None,
         "snapshot_id": getattr(manifest, "snapshot_id", None),
         "feature_fill": {
             name: float(panel[name].notna().mean()) for name in present
@@ -420,6 +465,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--train-days", type=int, default=60)
     parser.add_argument("--test-days", type=int, default=20)
     parser.add_argument("--purge-days", type=int, default=60)
+    parser.add_argument("--expanding", action="store_true", help="train on all prior history")
+    parser.add_argument("--min-train-days", type=int, default=250)
     parser.add_argument("--top-k", default="20,50")
     parser.add_argument("--min-train-rows", type=int, default=500)
     parser.add_argument("--min-test-rows", type=int, default=100)
@@ -474,6 +521,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 train_days=args.train_days,
                 test_days=args.test_days,
                 purge_days=args.purge_days,
+                expanding=args.expanding,
+                min_train_days=args.min_train_days,
                 top_ks=top_ks,
                 label_col=LABEL_COL,
                 lgb_params={**lgb_params, "num_boost_round": args.num_boost_round},
@@ -510,6 +559,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "train_days": args.train_days,
                     "test_days": args.test_days,
                     "purge_days": args.purge_days,
+                    "expanding": args.expanding,
+                    "min_train_days": args.min_train_days,
                     "top_ks": top_ks,
                     "lgb_params": lgb_params,
                     "pools": metas,
