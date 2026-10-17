@@ -14,6 +14,7 @@ from pymongo import MongoClient
 from quant_model_platform.config import PlatformConfig
 from quant_model_platform.dataset.alt_factors import (
     load_analyst_revision,
+    load_chip_factors,
     load_unlock_overhang,
 )
 from quant_model_platform.dataset.features import add_missing_flags, registry_names
@@ -403,6 +404,13 @@ def _attach_alt_factors(
             end_date=end_date,
         ),
         load_unlock_overhang(
+            client,
+            data_db_name=data_db_name,
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+        ),
+        load_chip_factors(
             client,
             data_db_name=data_db_name,
             symbols=symbols,

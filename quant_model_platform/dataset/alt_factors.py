@@ -31,11 +31,15 @@ _ANALYST_COLLECTION = "earnings_report_rc"
 _ANALYST_PROJECTION = {"_id": 0, "ts_code": 1, "report_date": 1, "eps": 1}
 _UNLOCK_COLLECTION = "share_float"
 _UNLOCK_PROJECTION = {"_id": 0, "ts_code": 1, "ann_date": 1, "float_date": 1, "float_ratio": 1}
+_CHIP_COLLECTION = "cyq_perf"
+_CHIP_PROJECTION = {"_id": 0, "symbol": 1, "trade_date": 1, "cost_15pct": 1,
+                    "cost_50pct": 1, "cost_85pct": 1, "weight_avg": 1}
 _SYMBOL_CHUNK = 250
 
 ANALYST_FACTORS = ("analyst_rev_60d",)
 UNLOCK_FACTORS = ("unlock_overhang_60d",)
-ALT_FEATURE_NAMES = ANALYST_FACTORS + UNLOCK_FACTORS
+CHIP_FACTORS = ("cyq_conc", "cyq_skew")
+ALT_FEATURE_NAMES = ANALYST_FACTORS + UNLOCK_FACTORS + CHIP_FACTORS
 
 #: Consensus smoothing window and its minimum sample, in calendar days.
 _REV_WINDOW_DAYS = 60
@@ -147,6 +151,61 @@ def load_analyst_revision(
                 "ts_code": code,
                 "analyst_rev_60d": rev[emit].astype("float64"),
             }))
+    if not frames:
+        return empty
+    return pd.concat(frames, ignore_index=True)
+
+
+def load_chip_factors(
+    client: MongoClient,
+    *,
+    data_db_name: str,
+    symbols: Sequence[str],
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """``cyq_conc`` / ``cyq_skew`` per (trade_date, ts_code) from cyq_perf.
+
+    ``cyq_perf`` is already a daily per-symbol snapshot keyed by trade_date,
+    so each row is the PIT value directly -- no event machinery. Queried by
+    ``symbol`` (the field the collection's own index covers; ``ts_code`` is
+    stored but unindexed), then renamed to the panel's ``ts_code`` join key.
+
+    * ``cyq_conc = (cost_85pct - cost_15pct) / weight_avg`` -- how wide the
+      chip distribution is around its mean cost (the "peak" width).
+    * ``cyq_skew = (cost_85pct - cost_50pct) / (cost_50pct - cost_15pct)`` --
+      asymmetry: trapped supply above vs profit-taking supply below.
+
+    Coverage starts 2018-01-02 (the collection does); a symbol-day with no row
+    stays NaN and is carried by the missing flag.
+    """
+    empty = pd.DataFrame(columns=["trade_date", "ts_code", *CHIP_FACTORS])
+    start_dt = _parse_day(start_date)
+    end_dt = _parse_day(end_date)
+    if start_dt is None or end_dt is None or not symbols:
+        return empty
+    coll = client[data_db_name][_CHIP_COLLECTION]
+    lo, hi = start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d")
+
+    frames: List[pd.DataFrame] = []
+    for batch in _chunks(symbols):
+        docs = list(coll.find(
+            {"symbol": {"$in": batch}, "trade_date": {"$gte": lo, "$lte": hi}},
+            _CHIP_PROJECTION,
+        ))
+        if not docs:
+            continue
+        raw = pd.DataFrame(docs)
+        for col in ("cost_15pct", "cost_50pct", "cost_85pct", "weight_avg"):
+            raw[col] = pd.to_numeric(raw[col], errors="coerce")
+        wavg = raw["weight_avg"].where(raw["weight_avg"] > 0)
+        raw["cyq_conc"] = (raw["cost_85pct"] - raw["cost_15pct"]) / wavg
+        den = raw["cost_50pct"] - raw["cost_15pct"]
+        raw["cyq_skew"] = ((raw["cost_85pct"] - raw["cost_50pct"])
+                           / den.mask(den.abs() < 1e-6))
+        raw = raw.rename(columns={"symbol": "ts_code"})
+        raw["trade_date"] = raw["trade_date"].astype(str).str[:8]
+        frames.append(raw[["trade_date", "ts_code", *CHIP_FACTORS]])
     if not frames:
         return empty
     return pd.concat(frames, ignore_index=True)

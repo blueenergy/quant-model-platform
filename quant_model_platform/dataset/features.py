@@ -40,6 +40,9 @@ DEFAULT_FEATURE_REGISTRY: List[FeatureSpec] = [
     # B6e-2 alternative channels (novelty gate 2026-10-17, llm-wiki B6e-1).
     FeatureSpec("analyst_rev_60d", source="earnings_report_rc"),
     FeatureSpec("unlock_overhang_60d", source="share_float"),
+    # B6e-3 chip distribution (same gate: conc 0.071 / skew 0.270 vs scores).
+    FeatureSpec("cyq_conc", source="cyq_perf"),
+    FeatureSpec("cyq_skew", source="cyq_perf"),
 ]
 
 

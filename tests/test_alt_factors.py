@@ -11,6 +11,7 @@ import pytest
 
 from quant_model_platform.dataset.alt_factors import (
     load_analyst_revision,
+    load_chip_factors,
     load_unlock_overhang,
 )
 from quant_model_platform.dataset.production import _attach_alt_factors
@@ -167,6 +168,55 @@ def test_analyst_revision_is_pit_a_report_cannot_move_the_past():
                 == value_on(shifted, day, "analyst_rev_60d")) or (
                 np.isnan(value_on(base, day, "analyst_rev_60d"))
                 and np.isnan(value_on(shifted, day, "analyst_rev_60d")))
+
+
+def chip_frame(rows, start, end):
+    docs = [
+        {"symbol": s, "trade_date": d, **vals} for s, d, vals in rows
+    ]
+    client = FakeClient({"cyq_perf": docs})
+    symbols = sorted({s for s, _, _ in rows}) or [SYMBOL]
+    return load_chip_factors(
+        client,
+        data_db_name="quant_data",
+        symbols=symbols,
+        start_date=start,
+        end_date=end,
+    )
+
+
+def test_chip_factors_hand_computed():
+    # 000001.SZ on 20261016 as stored by the backfill: 10.0 / 11.0 / 11.6, avg 11.0
+    frame = chip_frame(
+        [(SYMBOL, "20261016",
+          {"cost_15pct": 10.0, "cost_50pct": 11.0,
+           "cost_85pct": 11.6, "weight_avg": 11.0})],
+        "20261001", "20261031",
+    )
+    assert value_on(frame, "20261016", "cyq_conc") == pytest.approx(1.6 / 11.0, rel=1e-4)
+    assert value_on(frame, "20261016", "cyq_skew") == pytest.approx(0.6, rel=1e-4)
+
+
+def test_chip_skew_guards_zero_denominator():
+    frame = chip_frame(
+        [(SYMBOL, "20261016",
+          {"cost_15pct": 11.0, "cost_50pct": 11.0,
+           "cost_85pct": 12.0, "weight_avg": 11.0})],
+        "20261001", "20261031",
+    )
+    assert np.isnan(value_on(frame, "20261016", "cyq_skew"))
+    assert value_on(frame, "20261016", "cyq_conc") == pytest.approx(1.0 / 11.0, rel=1e-4)
+
+
+def test_chip_conc_guards_nonpositive_weight_avg():
+    frame = chip_frame(
+        [(SYMBOL, "20261016",
+          {"cost_15pct": 10.0, "cost_50pct": 11.0,
+           "cost_85pct": 11.6, "weight_avg": 0.0})],
+        "20261001", "20261031",
+    )
+    assert np.isnan(value_on(frame, "20261016", "cyq_conc"))
+    assert value_on(frame, "20261016", "cyq_skew") == pytest.approx(0.6, rel=1e-4)
 
 
 def test_attach_fills_unlock_zero_and_keeps_analyst_nan():
