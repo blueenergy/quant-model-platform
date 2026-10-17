@@ -114,11 +114,18 @@ def train_lightgbm(frame: pd.DataFrame, feature_names: Sequence[str], label_col:
         raise RuntimeError("lightgbm is not installed")
     x, cols = _feature_matrix(frame, feature_names)
     y = frame[label_col].astype(float).values
-    mask = np.isfinite(y) & np.all(np.isfinite(x), axis=1)
+    # LightGBM handles missing feature values natively. Requiring every feature
+    # to be present would drop the whole row once the feature set includes a
+    # sparse factor (financials, analyst revisions, ...), which is the opposite
+    # of what the missing-value split is for. Only the label must exist.
+    mask = np.isfinite(y)
     default = {"objective": "regression", "metric": "l2", "verbosity": -1, "num_leaves": 31, "learning_rate": 0.05}
     merged = {**default, **(params or {})}
+    # ``num_boost_round`` is an lgb.train argument, not a booster parameter;
+    # passing it through ``params`` silently leaves the hard-coded 50 in place.
+    num_boost_round = int(merged.pop("num_boost_round", 50))
     train_set = lgb.Dataset(x[mask], label=y[mask], feature_name=cols)
-    booster = lgb.train(merged, train_set, num_boost_round=50)
+    booster = lgb.train(merged, train_set, num_boost_round=num_boost_round)
     return TrainedModel(kind="lightgbm", feature_names=cols, artifact={"booster": booster}, params=merged)
 
 
