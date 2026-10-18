@@ -88,3 +88,53 @@ def test_the_label_matches_a_hand_computed_forward_return():
     for i, date in enumerate(DATES[:-2]):
         assert got.loc[(date, "000001.SZ")] == pytest.approx(expected[i])
     assert got.loc[(DATES[0], "600000.SH")] != got.loc[(DATES[0], "000001.SZ")]
+
+
+# --- size_neutral: implemented since B6a, first caller in B6e-4 ------------
+
+
+def test_size_neutral_residualizes_against_log_market_cap():
+    from quant_model_platform.dataset.labels import neutralize_cross_section
+
+    frame = pd.DataFrame({
+        "trade_date": ["20240102"] * 3,
+        "ts_code": ["a", "b", "c"],
+        "label_raw": [0.1, 0.2, 0.31],
+        "log_market_cap": [1.0, 2.0, 3.0],
+    })
+    got = neutralize_cross_section(frame, "label_raw", mode="size_neutral")
+    # OLS slope 0.105, intercept -0.006667; residuals as computed by hand.
+    assert got.tolist() == pytest.approx([0.0016667, -0.0033333, 0.0016667], abs=1e-6)
+    # Residuals of an OLS fit with an intercept are orthogonal to the regressor.
+    assert abs(float(pd.Series(got.tolist()).corr(frame["log_market_cap"]))) < 1e-12
+
+
+def test_size_neutral_falls_back_to_demean_without_the_size_column():
+    from quant_model_platform.dataset.labels import neutralize_cross_section
+
+    frame = pd.DataFrame({
+        "trade_date": ["20240102"] * 3,
+        "ts_code": ["a", "b", "c"],
+        "label_raw": [0.1, 0.2, 0.31],
+    })
+    got = neutralize_cross_section(frame, "label_raw", mode="size_neutral")
+    demeaned = neutralize_cross_section(frame, "label_raw", mode="demean")
+    pd.testing.assert_series_equal(got, demeaned)
+
+
+def test_size_neutral_thin_dates_fall_back_to_demean():
+    from quant_model_platform.dataset.labels import neutralize_cross_section
+
+    frame = pd.DataFrame({
+        "trade_date": ["20240102"] * 2 + ["20240103"] * 3,
+        "ts_code": ["a", "b", "c", "d", "e"],
+        "label_raw": [0.1, 0.3, 0.1, 0.2, 0.31],
+        "log_market_cap": [1.0, 3.0, 1.0, 2.0, 3.0],
+    })
+    got = neutralize_cross_section(frame, "label_raw", mode="size_neutral")
+    # 20240102 has only 2 usable samples (< MIN_SIZE_SAMPLES): plain demean.
+    thin = got[frame["trade_date"] == "20240102"]
+    assert thin.tolist() == pytest.approx([-0.1, 0.1], abs=1e-9)
+    # 20240103 has 3: residuals, not demean (demean would give [-0.1033, -0.0033, 0.1067]).
+    thick = got[frame["trade_date"] == "20240103"].tolist()
+    assert thick == pytest.approx([0.0016667, -0.0033333, 0.0016667], abs=1e-6)

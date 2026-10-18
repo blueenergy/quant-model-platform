@@ -86,7 +86,14 @@ def neutralize_cross_section(
             pred = coef[0] * x + coef[1]
             return y - pred
 
-        return frame.groupby(date_col, sort=False, group_keys=False).apply(_residual)
+        # Explicit concat rather than groupby.apply: on pandas 3 a
+        # DataFrameGroupBy.apply wraps the per-group Series into a DataFrame,
+        # which then gets assigned to the label column as a frame -- the
+        # caller must receive a Series (b98062e flagged this branch as
+        # returning a frame on its then-unreachable path; 2026-10-18 is the
+        # first caller). reindex restores the original row order.
+        parts = [_residual(group) for _, group in frame.groupby(date_col, sort=False)]
+        return pd.concat(parts).reindex(frame.index)
     raise ValueError(f"unknown neutralize mode: {mode}")
 
 

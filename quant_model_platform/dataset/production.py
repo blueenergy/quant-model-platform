@@ -20,6 +20,7 @@ from quant_model_platform.dataset.alt_factors import (
 from quant_model_platform.dataset.features import add_missing_flags, registry_names
 from quant_model_platform.dataset.labels import attach_label_column
 from quant_model_platform.dataset.manifest import build_manifest, write_parquet_snapshot
+from quant_model_platform.protocol import LabelNeutralize
 from quant_model_platform.dataset.raw_factors import (
     WARMUP_OBSERVATIONS,
     derive_daily_basic_factors,
@@ -443,8 +444,15 @@ def build_production_panel(
     config: Optional[PlatformConfig] = None,
     client: Optional[MongoClient] = None,
     use_canonical_snapshot: bool = False,
+    label_neutralize: LabelNeutralize = "demean",
 ) -> Tuple[pd.DataFrame, Any]:
-    """Build PIT score panel + forward labels; write parquet under parquet_dir."""
+    """Build PIT score panel + forward labels; write parquet under parquet_dir.
+
+    ``label_neutralize`` defaults to the production demean; pass
+    ``"size_neutral"`` to residualize the label against ``log_market_cap``
+    (the B6e-4 style check). Non-default modes are recorded in
+    ``source_revision`` so a variant artifact cannot read as production.
+    """
     cfg = config or PlatformConfig.from_env()
     own_client = client is None
     mongo = client or MongoClient(cfg.mongo_uri, tz_aware=True)
@@ -482,7 +490,6 @@ def build_production_panel(
         )
         if prices.empty:
             raise RuntimeError(f"no volume_price rows in {cfg.data_db_name} for panel symbols")
-        panel = attach_label_column(panel, prices)
         panel = _attach_raw_factors(
             mongo,
             panel,
@@ -492,6 +499,13 @@ def build_production_panel(
             start_date=warmup_start,
             end_date=end_date,
         )
+        # After the raw factors, not before: ``size_neutral`` residualizes the
+        # label against ``log_market_cap``, which is a present-but-empty
+        # placeholder until _attach_raw_factors fills it. Attached earlier,
+        # the label silently degrades to demean on every date -- 2026-10-18's
+        # first size_neutral build did exactly that, and the guard's warning
+        # is what caught it.
+        panel = attach_label_column(panel, prices, neutralize=label_neutralize)
         # Alt-channel loaders carry their own lookback, so they only need the
         # panel window itself (unlike the price factors above).
         panel = _attach_alt_factors(
@@ -516,6 +530,7 @@ def build_production_panel(
         # identically to the scores-only one it replaced.
         source_revision = (
             f"stock_scores:{cfg.mongo_db}:{index_code}:{start_date}-{end_date}:rawfactors-v1"
+            + (f":label-{label_neutralize}" if label_neutralize != "demean" else "")
         )
         manifest = build_manifest(
             panel,

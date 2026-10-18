@@ -39,6 +39,8 @@ def main(argv=None) -> int:
     parser.add_argument("--end-date", required=True, help="YYYYMMDD or latest")
     parser.add_argument("--canonical", action="store_true", help="Overwrite per-index current.parquet + stable snapshot_id")
     parser.add_argument("--register-mongo", action="store_true", help="Insert/upsert dataset_manifests in quant_ml")
+    parser.add_argument("--label-neutralize", choices=["none", "demean", "size_neutral"],
+                        default="demean", help="Label neutralization; non-default modes are variant builds (B6e-4)")
     args = parser.parse_args(argv)
 
     cfg = PlatformConfig.from_env()
@@ -51,6 +53,7 @@ def main(argv=None) -> int:
         parquet_dir=parquet_dir,
         config=cfg,
         use_canonical_snapshot=args.canonical,
+        label_neutralize=args.label_neutralize,
     )
     local_path = parquet_dir / (
         f"{args.index_code}_current.parquet"
