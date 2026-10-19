@@ -119,6 +119,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     summary_rows: List[Dict[str, Any]] = []
     yearly_rows: List[Dict[str, Any]] = []
+    paired_rows: List[Dict[str, Any]] = []
     try:
         for pool in index_codes:
             predictions_path = Path(args.predictions_dir) / f"predictions_{pool}.parquet"
@@ -170,6 +171,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             cash_share = float(len([d for d in signal_dates if d in cash_dates]) / len(signal_dates))
 
+            rows_by_key: Dict[tuple, List[Dict[str, Any]]] = {}
             for window in windows:
                 frame = predictions[predictions["window"] == window]
                 scores_by_date: Dict[str, List[Dict[str, Any]]] = {}
@@ -188,6 +190,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         track=f"{window}_{'overlay' if overlay else 'raw'}",
                         cash_dates=cash_dates if overlay else None,
                     )
+                    rows_by_key[(window, overlay)] = rows
                     stats = equity_stats(rows, hold_days=HOLD_DAYS)
                     periods = sum(1 for row in rows if row.get("net_return") is not None)
                     yearly = _yearly_returns(rows)
@@ -222,11 +225,63 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         }
                     )
                 print(f"[{pool}] {window} done", flush=True)
+
+            # Paired per-period difference against the first window. The
+            # absolute-mean t in the summary treats each window separately; this
+            # is the statistic that answers "is rolling_500 better than
+            # rolling_60?" because the two rows share the same date, pool and
+            # regime state.
+            reference_window = windows[0]
+            for overlay in (False, True):
+                ref_rows = rows_by_key.get((reference_window, overlay)) or []
+                ref_map = {
+                    str(row["trade_date"]): float(row["net_return"])
+                    for row in ref_rows
+                    if row.get("net_return") is not None
+                }
+                for window in windows[1:]:
+                    cur_rows = rows_by_key.get((window, overlay)) or []
+                    cur_map = {
+                        str(row["trade_date"]): float(row["net_return"])
+                        for row in cur_rows
+                        if row.get("net_return") is not None
+                    }
+                    common = sorted(set(ref_map) & set(cur_map))
+                    diffs = [cur_map[day] - ref_map[day] for day in common]
+                    if not diffs:
+                        continue
+                    mean_diff = float(np.mean(diffs))
+                    std_diff = float(np.std(diffs, ddof=1)) if len(diffs) > 1 else float("nan")
+                    se = (
+                        std_diff / math.sqrt(len(diffs))
+                        if std_diff and not math.isnan(std_diff)
+                        else float("nan")
+                    )
+                    paired_rows.append(
+                        {
+                            "index_code": pool,
+                            "window": window,
+                            "reference": reference_window,
+                            "overlay": overlay,
+                            "periods": len(diffs),
+                            "mean_diff": mean_diff,
+                            "t_stat": (
+                                mean_diff / se
+                                if se and not math.isnan(se)
+                                else float("nan")
+                            ),
+                            "mde80": (
+                                2.802 * se if se and not math.isnan(se) else float("nan")
+                            ),
+                            "win_rate": float((np.asarray(diffs) > 0).mean()),
+                        }
+                    )
     finally:
         client.close()
 
     summary = pd.DataFrame(summary_rows)
     yearly = pd.DataFrame(yearly_rows)
+    paired = pd.DataFrame(paired_rows)
 
     lines = [
         "# 生产口径回测：四窗口 × regime overlay",
@@ -247,6 +302,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"{_pct(row.max_drawdown)} | {_pct(row.worst_year)} | "
             f"{_pct(row.avg_turnover)} | {_pct(row.cash_share)} | {_fmt(row.t_stat)} |"
         )
+
+    if not paired.empty:
+        lines.extend(
+            [
+                "",
+                "## 配对差（rolling_500 − rolling_60，逐期）",
+                "",
+                "| 池 | 窗口 | overlay | 期数 | 平均差/期 | t | MDE80 | 胜率 |",
+                "|---|---|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row in paired.sort_values(
+            ["index_code", "window", "overlay"]
+        ).itertuples(index=False):
+            lines.append(
+                f"| {row.index_code} | `{row.window}` | {'on' if row.overlay else 'off'} | "
+                f"{row.periods} | {_pct(row.mean_diff)} | {_fmt(row.t_stat)} | "
+                f"{_pct(row.mde80)} | {_pct(row.win_rate)} |"
+            )
 
     if not yearly.empty:
         lines.extend(["", "## 分年净收益（overlay on）", ""])
@@ -278,6 +352,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         json.dumps(
             {
                 "summary": summary.to_dict(orient="records"),
+                "paired": paired.to_dict(orient="records"),
                 "yearly": yearly.to_dict(orient="records"),
             },
             ensure_ascii=False,
