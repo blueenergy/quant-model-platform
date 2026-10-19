@@ -74,6 +74,7 @@ def simulate_track(
     top_n: int,
     track: str,
     cash_dates: Optional[Sequence[str]] = None,
+    rank_start: int = 0,
 ) -> List[Dict[str, Any]]:
     """Rebalance chain for one track. A day with no usable cross-section holds.
 
@@ -86,6 +87,9 @@ def simulate_track(
     ``cash_dates`` is the optional regime overlay: the book is sold on those
     dates (one side of cost), the period return is zero, and the next invested
     date pays the opening side. ``None`` keeps the original behaviour.
+
+    ``rank_start`` selects a rank band instead of the top N: skip the first
+    ``rank_start`` names and hold the next ``top_n``. Zero keeps top-N.
     """
     cash_set = frozenset(str(day)[:8] for day in (cash_dates or ()))
     previous: List[str] = []
@@ -113,7 +117,13 @@ def simulate_track(
             previous = []
             continue
         cross_section = list(scores_by_date.get(day) or [])
-        selected = top_n_symbols(cross_section, score_key="score", n=top_n)
+        selected = top_n_symbols(
+            cross_section, score_key="score", n=int(rank_start) + int(top_n)
+        )
+        if rank_start:
+            # Rank band: skip the top ``rank_start`` names and hold the next
+            # ``top_n``. rank_start=0 is the original top-N book.
+            selected = selected[int(rank_start) :]
         carried = not selected
         holdings = list(previous) if carried else selected
         day_fwd = forward_returns.get(day) or {}

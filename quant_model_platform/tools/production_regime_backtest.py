@@ -104,6 +104,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--start", default="20150101")
     parser.add_argument("--end", default="20241231")
     parser.add_argument("--top-n", type=int, default=TOP_N)
+    parser.add_argument("--rank-start", type=int, default=0)
     parser.add_argument("--out", default="/tmp/factor_validation/production_backtest")
     args = parser.parse_args(argv)
 
@@ -189,6 +190,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         top_n=args.top_n,
                         track=f"{window}_{'overlay' if overlay else 'raw'}",
                         cash_dates=cash_dates if overlay else None,
+                        rank_start=args.rank_start,
                     )
                     rows_by_key[(window, overlay)] = rows
                     stats = equity_stats(rows, hold_days=HOLD_DAYS)
@@ -291,7 +293,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "# 生产口径回测：四窗口 × regime overlay",
         "",
         f"- 引擎：`demo.sources.holding_path`（next-open，一字涨跌停拒单）+ `demo.portfolio.simulate_track`",
-        f"- Top-N：{args.top_n}；持有 {HOLD_DAYS} 日；成本 13.5 bp/边（27 bp 全换手）",
+        f"- 书：rank_start={args.rank_start}, top_n={args.top_n}（0 为 top-N）；持有 {HOLD_DAYS} 日；成本 13.5 bp/边（27 bp 全换手）",
         f"- regime：`k_slow_anchor`，bull 持有，非 bull 空仓",
         "",
         "## 汇总",
