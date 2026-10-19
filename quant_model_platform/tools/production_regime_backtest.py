@@ -274,6 +274,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                 2.802 * se if se and not math.isnan(se) else float("nan")
                             ),
                             "win_rate": float((np.asarray(diffs) > 0).mean()),
+                            "diffs": [
+                                {"trade_date": day, "diff": cur_map[day] - ref_map[day]}
+                                for day in common
+                            ],
                         }
                     )
     finally:
