@@ -73,6 +73,7 @@ def simulate_track(
     *,
     top_n: int,
     track: str,
+    cash_dates: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Rebalance chain for one track. A day with no usable cross-section holds.
 
@@ -81,10 +82,36 @@ def simulate_track(
     no trade, so no turnover and no cost -- while a **forward window that has
     not happened yet** is recorded but priced as ``none``, keeping it out of the
     NAV instead of compounding it as a flat zero.
+
+    ``cash_dates`` is the optional regime overlay: the book is sold on those
+    dates (one side of cost), the period return is zero, and the next invested
+    date pays the opening side. ``None`` keeps the original behaviour.
     """
+    cash_set = frozenset(str(day)[:8] for day in (cash_dates or ()))
     previous: List[str] = []
     rows: List[Dict[str, Any]] = []
     for day in signal_dates:
+        if cash_set and str(day)[:8] in cash_set:
+            turnover = 1.0 if previous else 0.0
+            cost = turnover * COST_PER_SIDE
+            rows.append(
+                {
+                    "trade_date": day,
+                    "track": track,
+                    "holdings": [],
+                    "cross_section": "cash",
+                    "n_scored": len(scores_by_date.get(day) or []),
+                    "n_holdings": 0,
+                    "n_priced": 0,
+                    "pricing": "cash",
+                    "gross_return": 0.0,
+                    "one_way_turnover": turnover,
+                    "cost": cost,
+                    "net_return": -cost,
+                }
+            )
+            previous = []
+            continue
         cross_section = list(scores_by_date.get(day) or [])
         selected = top_n_symbols(cross_section, score_key="score", n=top_n)
         carried = not selected

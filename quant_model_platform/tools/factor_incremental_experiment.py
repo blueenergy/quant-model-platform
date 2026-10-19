@@ -326,6 +326,7 @@ def _run_pool(
         first_test_index = longest + int(purge_days)
 
     records: List[Dict[str, Any]] = []
+    prediction_rows: List[pd.DataFrame] = []
     fold_counts: Dict[str, int] = {}
     for window_name, window_train_days in windows:
         folds = _window_folds(
@@ -383,12 +384,28 @@ def _run_pool(
                         top = day.nlargest(int(k), "pred")
                         record[f"top{k}_rebalance_return"] = float(top["raw_fwd"].mean())
                         record[f"top{k}_symbols"] = tuple(top["ts_code"].tolist())
+                    prediction_rows.append(
+                        scored.loc[
+                            scored["trade_date"] == rebalance_date,
+                            ["trade_date", "ts_code", "pred"],
+                        ].assign(
+                            index_code=index_code,
+                            window=window_name,
+                            set_name=set_name,
+                        )
+                    )
                 records.append(record)
             if (fold.fold_id + 1) % 20 == 0:
                 print(
                     f"[{index_code}] {window_name} fold {fold.fold_id + 1}/{len(folds)}",
                     flush=True,
                 )
+
+    if prediction_rows:
+        predictions = pd.concat(prediction_rows, ignore_index=True)
+        predictions.to_parquet(
+            work_dir / f"predictions_{index_code}.parquet", index=False
+        )
 
     meta = {
         "index_code": index_code,
