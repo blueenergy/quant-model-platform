@@ -105,6 +105,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--end", default="20241231")
     parser.add_argument("--top-n", type=int, default=TOP_N)
     parser.add_argument("--rank-start", type=int, default=0)
+    parser.add_argument("--save-trades", action="store_true")
     parser.add_argument("--out", default="/tmp/factor_validation/production_backtest")
     args = parser.parse_args(argv)
 
@@ -121,6 +122,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     summary_rows: List[Dict[str, Any]] = []
     yearly_rows: List[Dict[str, Any]] = []
     paired_rows: List[Dict[str, Any]] = []
+    trade_rows: List[Dict[str, Any]] = []
     try:
         for pool in index_codes:
             predictions_path = Path(args.predictions_dir) / f"predictions_{pool}.parquet"
@@ -193,6 +195,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         rank_start=args.rank_start,
                     )
                     rows_by_key[(window, overlay)] = rows
+                    for row in rows:
+                        trade_rows.append(
+                            {
+                                "index_code": pool,
+                                "window": window,
+                                "overlay": overlay,
+                                **row,
+                                "holdings": ";".join(
+                                    str(symbol) for symbol in (row.get("holdings") or [])
+                                ),
+                            }
+                        )
                     stats = equity_stats(rows, hold_days=HOLD_DAYS)
                     periods = sum(1 for row in rows if row.get("net_return") is not None)
                     yearly = _yearly_returns(rows)
@@ -288,6 +302,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     summary = pd.DataFrame(summary_rows)
     yearly = pd.DataFrame(yearly_rows)
     paired = pd.DataFrame(paired_rows)
+    trades = pd.DataFrame(trade_rows)
 
     lines = [
         "# 生产口径回测：四窗口 × regime overlay",
@@ -367,6 +382,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ),
         encoding="utf-8",
     )
+    if args.save_trades and not trades.empty:
+        trades_path = out_dir / "trades.csv"
+        trades.to_csv(trades_path, index=False, encoding="utf-8")
+        print(f"trades -> {trades_path} rows={len(trades)}")
     print(summary.to_string(index=False))
     print(f"report -> {out_dir / 'report.md'}")
     return 0
