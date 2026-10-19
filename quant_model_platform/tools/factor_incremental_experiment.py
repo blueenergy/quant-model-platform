@@ -482,6 +482,8 @@ def _nav_summary(
     *,
     top_k: int,
     cost_bps: float,
+    actions: Optional[pd.Series] = None,
+    overlay: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Long-only top-K NAV per training window, with turnover cost.
 
@@ -506,21 +508,38 @@ def _nav_summary(
         net_returns: List[float] = []
         turnovers: List[float] = []
         dates: List[str] = []
+        cash_flags: List[float] = []
         for row in group.itertuples(index=False):
-            ret = float(getattr(row, return_col))
+            raw_ret = float(getattr(row, return_col))
             symbols = set(getattr(row, symbol_col) or ())
-            if previous is None or not previous:
-                turnover = 1.0
+            action = "invest"
+            if actions is not None:
+                rebalance_date = str(getattr(row, "rebalance_date"))
+                if rebalance_date in actions.index:
+                    action = str(actions.loc[rebalance_date])
+            in_cash = bool(overlay and action != "invest")
+            if in_cash:
+                ret = 0.0
+                # Sell the previous book on the way to cash; cash-to-cash has
+                # no turnover.
+                turnover = 0.0 if not previous else 1.0
+                current_symbols: set = set()
             else:
-                turnover = 1.0 - len(symbols & previous) / max(len(symbols), 1)
+                ret = raw_ret
+                if previous is None or not previous:
+                    turnover = 1.0  # buy from cash (or the first block)
+                else:
+                    turnover = 1.0 - len(symbols & previous) / max(len(symbols), 1)
+                current_symbols = symbols
             cost = turnover * float(cost_bps) / 10000.0
             net = ret - cost
             nav_gross *= 1.0 + ret
             nav_net *= 1.0 + net
             net_returns.append(net)
             turnovers.append(turnover)
+            cash_flags.append(1.0 if in_cash else 0.0)
             dates.append(str(getattr(row, "rebalance_date")))
-            previous = symbols
+            previous = current_symbols
 
         n = len(net_returns)
         if n == 0:
@@ -550,6 +569,7 @@ def _nav_summary(
                 "window": window_name,
                 "folds": n,
                 "avg_turnover": float(np.mean(turnovers)),
+                "cash_share": float(np.mean(cash_flags)) if cash_flags else 0.0,
                 "total_cost": float(sum(turnovers) * float(cost_bps) / 10000.0),
                 "ann_return_gross": ann_gross,
                 "ann_return_net": ann_net,
