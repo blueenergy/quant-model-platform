@@ -18,6 +18,7 @@ from quant_model_platform.training.panel_loader import load_training_panel
 from quant_model_platform.evaluation.gates import evaluate_fold, passes_promotion_gates
 from quant_model_platform.evaluation.metrics import permutation_test_ic, spearman_ic, summarize_ic
 from quant_model_platform.evaluation.walk_forward import purged_walk_forward_folds, split_frame_by_dates
+from quant_model_platform.protocol import LABEL_HORIZON_DAYS
 from quant_model_platform.queue import clean_for_mongo
 from quant_model_platform.training.models import predict_model, train_model
 
@@ -53,14 +54,22 @@ def run_training_job(
 
     feature_names = list(params.get("feature_names") or registry_names())
     dates = sorted(panel["trade_date"].unique().tolist())
+    # Purge must cover the label's forward span. With the default open-to-open
+    # label a training row at the last train date carries a return that ends
+    # `1 + horizon` bars later; a 3-day purge let that label window reach into
+    # the test block (panel dates are trading days, so horizon + 1 is the same
+    # unit). Callers may only make it stricter, never looser.
+    label_horizon_days = int(params.get("label_horizon_days", LABEL_HORIZON_DAYS))
+    purge_days = max(int(params.get("purge_days", 0)), label_horizon_days + 1)
     folds = purged_walk_forward_folds(
         dates,
         train_days=int(params.get("train_days", 12)),
         test_days=int(params.get("test_days", 5)),
-        purge_days=int(params.get("purge_days", 3)),
+        purge_days=purge_days,
     )
     fold_reports: List[Dict[str, Any]] = []
     models_trained = []
+    oos_frames: List[pd.DataFrame] = []
     for fold in folds:
         train = split_frame_by_dates(panel, fold.train_dates)
         test = split_frame_by_dates(panel, fold.test_dates)
@@ -71,6 +80,7 @@ def run_training_job(
         test = test.copy()
         test["pred"] = predict_model(test, model)
         test["baseline_pred"] = predict_model(test, baseline)
+        oos_frames.append(test)
         fold_reports.append(
             {
                 "fold_id": fold.fold_id,
@@ -87,7 +97,14 @@ def run_training_job(
     scored["pred"] = predict_model(scored, full_model)
     scored["baseline_pred"] = predict_model(scored, full_baseline)
     baseline_ic = summarize_ic(spearman_ic(scored, "baseline_pred", label_col))
-    perm_p = permutation_test_ic(scored, "pred", label_col, n_perm=int(params.get("n_perm", 50)))
+    # Permutation must run on out-of-sample fold predictions. Scoring the
+    # full-sample model on its own training panel inflates the observed IC and
+    # therefore understates p, letting weak models pass the gate.
+    if oos_frames:
+        oos = pd.concat(oos_frames, ignore_index=True)
+        perm_p = permutation_test_ic(oos, "pred", label_col, n_perm=int(params.get("n_perm", 50)))
+    else:
+        perm_p = 1.0
     promotion = passes_promotion_gates(
         [f["model"] for f in fold_reports],
         baseline_mean_ic=float(baseline_ic.get("mean_ic") or 0.0),
