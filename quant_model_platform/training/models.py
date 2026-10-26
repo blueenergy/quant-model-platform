@@ -49,6 +49,21 @@ def _feature_matrix(frame: pd.DataFrame, feature_names: Sequence[str]) -> np.nda
     return x, cols
 
 
+def _prediction_matrix(frame: pd.DataFrame, feature_names: Sequence[str]) -> np.ndarray:
+    """Fixed-width matrix for scoring: keep every declared feature in place.
+
+    Training drops columns that are empty in the training panel
+    (``_feature_columns``), because a constant column carries no information.
+    Scoring cannot do that: the saved scaler/booster has a fixed width, so a
+    column that is absent or all-NaN in today's snapshot must become NaN and
+    stay in place instead of shrinking the matrix. The model callers then
+    impute (linear, at the training mean) or let LightGBM handle NaN natively.
+    """
+    cols = list(feature_names)
+    x = frame.reindex(columns=cols).astype(float).to_numpy()
+    return x, cols
+
+
 def train_rule_baseline(frame: pd.DataFrame, feature_names: Sequence[str], *, weight_col: Optional[str] = None) -> TrainedModel:
     """Equal-weight average of z-scored features (per date)."""
     names = _feature_columns(frame, feature_names)
@@ -59,8 +74,13 @@ def predict_rule_baseline(frame: pd.DataFrame, model: TrainedModel) -> pd.Series
     names = model.feature_names
     if not names:
         return pd.Series(0.0, index=frame.index)
-    z = frame.groupby("trade_date", sort=False)[names].transform(lambda s: (s - s.mean()) / (s.std(ddof=0) + 1e-9))
-    return z[names].mean(axis=1)
+    # Reindex so a feature that is absent from today's snapshot becomes NaN
+    # instead of raising KeyError; NaN z-scores are skipped by mean(axis=1).
+    values = frame.reindex(columns=list(names)).astype(float)
+    z = values.groupby(frame["trade_date"], sort=False).transform(
+        lambda s: (s - s.mean()) / (s.std(ddof=0) + 1e-9)
+    )
+    return z.mean(axis=1)
 
 
 def train_ridge(frame: pd.DataFrame, feature_names: Sequence[str], label_col: str, alpha: float = 1.0) -> TrainedModel:
@@ -75,7 +95,7 @@ def train_ridge(frame: pd.DataFrame, feature_names: Sequence[str], label_col: st
 
 
 def predict_sklearn_linear(frame: pd.DataFrame, model: TrainedModel) -> pd.Series:
-    x, _ = _feature_matrix(frame, model.feature_names)
+    x, _ = _prediction_matrix(frame, model.feature_names)
     scaler = model.artifact["scaler"]
     reg = model.artifact["model"]
     # Scoring is not fitting: a row missing one input still needs a rank, so
@@ -135,7 +155,7 @@ def predict_model(frame: pd.DataFrame, model: TrainedModel) -> pd.Series:
     if model.kind in ("ridge", "elasticnet"):
         return predict_sklearn_linear(frame, model)
     if model.kind == "lightgbm":
-        x, _ = _feature_matrix(frame, model.feature_names)
+        x, _ = _prediction_matrix(frame, model.feature_names)
         booster = model.artifact["booster"]
         return pd.Series(booster.predict(x), index=frame.index)
     raise ValueError(f"unknown model kind: {model.kind}")

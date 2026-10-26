@@ -153,6 +153,82 @@ def test_a_missing_input_is_imputed_at_the_training_mean():
     )
 
 
+# --- scoring keeps the artifact width when today's panel drifts ---------------
+
+
+def test_scoring_keeps_a_column_that_is_empty_in_todays_snapshot():
+    """An all-NaN feature in today's panel must be imputed, not dropped.
+
+    The live shadow loop crashed on exactly this: a model trained with a
+    populated column met a snapshot where the column was empty, the matrix
+    shrank from 13 to 11 columns, and scaler.mean_ could not broadcast.
+    """
+    train = _frame(_rows())
+    train["momentum_20d"] = [0.01 * i for i in range(len(train))]
+    train["log_market_cap"] = [10.0 + i for i in range(len(train))]
+    model = train_ridge(train, [*SCORES, "momentum_20d", "log_market_cap"], "label_fwd_20d")
+
+    today = _frame(_rows())
+    today["momentum_20d"] = [0.01 * i for i in range(len(today))]
+    today["log_market_cap"] = np.nan
+    at_mean = today.copy()
+    at_mean["log_market_cap"] = float(train["log_market_cap"].mean())
+
+    pred = predict_sklearn_linear(today, model)
+    assert np.isfinite(pred.to_numpy()).all()
+    pd.testing.assert_series_equal(pred, predict_sklearn_linear(at_mean, model))
+
+
+def test_scoring_survives_a_column_absent_from_todays_snapshot():
+    """Same as above, but the column is missing entirely, not just all-NaN."""
+    train = _frame(_rows())
+    train["momentum_20d"] = [0.01 * i for i in range(len(train))]
+    train["log_market_cap"] = [10.0 + i for i in range(len(train))]
+    model = train_ridge(train, [*SCORES, "momentum_20d", "log_market_cap"], "label_fwd_20d")
+
+    # log_market_cap is absent from today's frame entirely (not just all-NaN).
+    today = _frame(_rows())
+    today["momentum_20d"] = [0.01 * i for i in range(len(today))]
+    at_mean = today.copy()
+    at_mean["log_market_cap"] = float(train["log_market_cap"].mean())
+
+    pred = predict_sklearn_linear(today, model)
+    assert np.isfinite(pred.to_numpy()).all()
+    pd.testing.assert_series_equal(pred, predict_sklearn_linear(at_mean, model))
+
+
+def test_lightgbm_scoring_survives_an_empty_column_in_todays_snapshot():
+    pytest.importorskip("lightgbm")
+    from quant_model_platform.training.models import train_lightgbm
+
+    train = _frame(_rows(n=40))
+    train["momentum_20d"] = [0.01 * i for i in range(len(train))]
+    train["log_market_cap"] = [10.0 + i for i in range(len(train))]
+    model = train_lightgbm(
+        train,
+        [*SCORES, "momentum_20d", "log_market_cap"],
+        "label_fwd_20d",
+        {"num_boost_round": 5},
+    )
+
+    today = _frame(_rows(n=40))
+    today["momentum_20d"] = [0.01 * i for i in range(len(today))]
+    today["log_market_cap"] = np.nan
+
+    pred = predict_model(today, model)
+    assert np.isfinite(pred.to_numpy()).all()
+
+
+def test_baseline_scoring_survives_an_absent_column():
+    frame = _frame(_rows())
+    frame["log_market_cap"] = [10.0 + i for i in range(len(frame))]
+    wide = train_rule_baseline(frame, [*SCORES, "log_market_cap"])
+    narrow = train_rule_baseline(frame, SCORES)
+    today = frame.drop(columns=["log_market_cap"])
+
+    pd.testing.assert_series_equal(predict_model(today, wide), predict_model(today, narrow))
+
+
 # --- the regression pin ------------------------------------------------------
 
 
