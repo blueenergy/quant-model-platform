@@ -7,7 +7,7 @@ name = "quant-model-platform"
 version = "0.1.0"
 description = "Standalone ML training platform for quant (quant_ml + Parquet snapshots)"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.23",
     "pandas>=2.0",
