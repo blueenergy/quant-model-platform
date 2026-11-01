@@ -55,6 +55,9 @@ ALT_FEATURE_NAMES = ANALYST_FACTORS + UNLOCK_FACTORS + CHIP_FACTORS
 #: Consensus smoothing window and its minimum sample, in calendar days.
 _REV_WINDOW_DAYS = 60
 _REV_MIN_PERIODS = 30
+#: Cap the revision ratio. EPS near zero makes the denominator tiny; one
+#: 1e16 row would dominate StandardScaler in training (2026-11-01 rebuild).
+_REV_CLIP = 5.0
 #: Extra lookback so the first panel day already has a full 60-day window and
 #: a value 60 days before it.
 _REV_LOOKBACK_DAYS = 130
@@ -105,7 +108,7 @@ def _revision_series(events: pd.DataFrame, grid: pd.DatetimeIndex) -> Optional[n
     with np.errstate(divide="ignore", invalid="ignore"):
         rev = np.where(~np.isnan(prev) & (prev != 0),
                        (level - prev) / np.abs(prev), np.nan)
-    return rev
+    return np.clip(rev, -_REV_CLIP, _REV_CLIP)
 
 
 def _fiscal_year_from_quarter(value: Any) -> Optional[int]:
