@@ -389,8 +389,9 @@ def _attach_alt_factors(
     Same join discipline as ``_attach_raw_factors``: drop overlapping columns
     first, then refuse to fan the panel out.
 
-    ``analyst_rev_60d`` stays NaN where a symbol has no analyst coverage; the
-    registry's missing flag carries that. ``unlock_overhang_60d`` is filled
+    ``analyst_rev_60d`` (FY1) and ``analyst_rev_fy2_60d`` (FY2) stay NaN where
+    a symbol has no analyst coverage; the registry's missing flag carries
+    that. ``unlock_overhang_60d`` is filled
     with 0.0 after the join: ``share_float`` is market-wide and
     event-complete back to 2005, so an absent row means "no scheduled
     unlock", which is a fact about the stock rather than missing data.

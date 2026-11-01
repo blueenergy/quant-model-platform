@@ -129,8 +129,8 @@ def test_overhang_sums_overlapping_events():
 
 def analyst_frame(eps_events, start, end):
     docs = [
-        {"ts_code": SYMBOL, "report_date": d, "eps": e}
-        for d, e in eps_events
+        {"ts_code": SYMBOL, "report_date": d, "quarter": q, "eps": e}
+        for d, q, e in eps_events
     ]
     client = FakeClient({"earnings_report_rc": docs})
     return load_analyst_revision(
@@ -143,7 +143,7 @@ def analyst_frame(eps_events, start, end):
 
 
 def test_analyst_revision_hand_computed_value():
-    frame = analyst_frame([("20240115", 1.0), ("20240310", 2.0)],
+    frame = analyst_frame([("20240115", "2024Q4", 1.0), ("20240310", "2024Q4", 2.0)],
                           "20240401", "20240501")
     assert frame["trade_date"].min() == "20240401"     # only the panel window
     # level(0415) = (23*1.0 + 37*2.0) / 60; level(0215) = 1.0
@@ -154,20 +154,71 @@ def test_analyst_revision_hand_computed_value():
 def test_analyst_revision_seeds_from_reports_before_the_lookback():
     # The only report predates the 130-day lookback of a 2024-01-01 start;
     # the forward-fill must still seed from it instead of opening with NaN.
-    frame = analyst_frame([("20230110", 1.0)], "20240101", "20240201")
+    frame = analyst_frame([("20230110", "2024Q4", 1.0)], "20240101", "20240201")
     assert value_on(frame, "20240115", "analyst_rev_60d") == 0.0
 
 
 def test_analyst_revision_is_pit_a_report_cannot_move_the_past():
-    base = analyst_frame([("20240115", 1.0), ("20240310", 2.0)],
+    base = analyst_frame([("20240115", "2024Q4", 1.0), ("20240310", "2024Q4", 2.0)],
                          "20240401", "20240501")
-    shifted = analyst_frame([("20240115", 1.0), ("20240310", 2.0), ("20240420", 9.0)],
+    shifted = analyst_frame([("20240115", "2024Q4", 1.0), ("20240310", "2024Q4", 2.0),
+                             ("20240420", "2024Q4", 9.0)],
                             "20240401", "20240501")
     for day in ("20240401", "20240415", "20240419"):
         assert (value_on(base, day, "analyst_rev_60d")
                 == value_on(shifted, day, "analyst_rev_60d")) or (
                 np.isnan(value_on(base, day, "analyst_rev_60d"))
                 and np.isnan(value_on(shifted, day, "analyst_rev_60d")))
+
+
+def test_analyst_revision_selects_fy1_not_the_mean_of_all_years():
+    # A report carries three annual forecasts. Only FY2024 should drive the
+    # FY1 revision; averaging 2024/2025/2026 would give a much smaller move.
+    docs = [
+        ("20240115", "2024Q4", 1.0), ("20240115", "2025Q4", 2.0),
+        ("20240115", "2026Q4", 3.0),
+        ("20240310", "2024Q4", 2.0), ("20240310", "2025Q4", 2.0),
+        ("20240310", "2026Q4", 3.0),
+    ]
+    frame = analyst_frame(docs, "20240401", "20240501")
+    expected = (97.0 / 60.0 - 1.0) / 1.0
+    assert value_on(frame, "20240415", "analyst_rev_60d") == pytest.approx(expected, rel=1e-3)
+    # FY2 (2025) is flat 2.0 -> 2.0.
+    assert value_on(frame, "20240415", "analyst_rev_fy2_60d") == pytest.approx(0.0)
+
+
+def test_analyst_revision_uses_median_across_orgs():
+    docs = [
+        {"ts_code": SYMBOL, "report_date": "20240115", "quarter": "2024Q4",
+         "org_name": "A", "eps": 1.0},
+        {"ts_code": SYMBOL, "report_date": "20240115", "quarter": "2024Q4",
+         "org_name": "B", "eps": 2.0},
+        {"ts_code": SYMBOL, "report_date": "20240115", "quarter": "2024Q4",
+         "org_name": "C", "eps": 100.0},
+        {"ts_code": SYMBOL, "report_date": "20240310", "quarter": "2024Q4",
+         "org_name": "A", "eps": 3.0},
+        {"ts_code": SYMBOL, "report_date": "20240310", "quarter": "2024Q4",
+         "org_name": "B", "eps": 4.0},
+        {"ts_code": SYMBOL, "report_date": "20240310", "quarter": "2024Q4",
+         "org_name": "C", "eps": 100.0},
+    ]
+    client = FakeClient({"earnings_report_rc": docs})
+    frame = load_analyst_revision(
+        client, data_db_name="quant_data", symbols=[SYMBOL],
+        start_date="20240401", end_date="20240501",
+    )
+    # Median is 2.0 -> 4.0; the mean would be 34.3 -> 35.7 and nearly cancel.
+    expected = (23.0 * 2.0 + 37.0 * 4.0) / 60.0 / 2.0 - 1.0
+    assert value_on(frame, "20240415", "analyst_rev_60d") == pytest.approx(expected, rel=1e-3)
+
+
+def test_analyst_revision_ignores_non_annual_forecasts():
+    docs = [
+        ("20240115", "2024Q4", 1.0),
+        ("20240310", "2024Q2", 99.0),  # interim forecast must not move FY1
+    ]
+    frame = analyst_frame(docs, "20240401", "20240501")
+    assert value_on(frame, "20240415", "analyst_rev_60d") == pytest.approx(0.0)
 
 
 def chip_frame(rows, start, end):

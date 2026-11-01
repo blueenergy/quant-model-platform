@@ -4,6 +4,10 @@ Both channels cleared the novelty gate against the four production scores
 (|daily Spearman| < 0.35 over the full window; llm-wiki B6e-1, 2026-10-17):
 `analyst_rev_60d` max 0.171 (cycle), `unlock_overhang_60d` max 0.080 (value).
 
+The analyst gate was measured on the old mixed-horizon version, which averaged
+the 2024/2025/2026 EPS rows of one report.  The FY1/FY2 split below is a
+different signal and must be re-gated before it enters a model.
+
 PIT discipline:
 
 * ``earnings_report_rc.report_date`` is the research report's publication day,
@@ -28,7 +32,14 @@ from pymongo import MongoClient
 log = logging.getLogger(__name__)
 
 _ANALYST_COLLECTION = "earnings_report_rc"
-_ANALYST_PROJECTION = {"_id": 0, "ts_code": 1, "report_date": 1, "eps": 1}
+_ANALYST_PROJECTION = {
+    "_id": 0,
+    "ts_code": 1,
+    "report_date": 1,
+    "org_name": 1,
+    "quarter": 1,
+    "eps": 1,
+}
 _UNLOCK_COLLECTION = "share_float"
 _UNLOCK_PROJECTION = {"_id": 0, "ts_code": 1, "ann_date": 1, "float_date": 1, "float_ratio": 1}
 _CHIP_COLLECTION = "cyq_perf"
@@ -36,7 +47,7 @@ _CHIP_PROJECTION = {"_id": 0, "symbol": 1, "trade_date": 1, "cost_15pct": 1,
                     "cost_50pct": 1, "cost_85pct": 1, "weight_avg": 1}
 _SYMBOL_CHUNK = 250
 
-ANALYST_FACTORS = ("analyst_rev_60d",)
+ANALYST_FACTORS = ("analyst_rev_60d", "analyst_rev_fy2_60d")
 UNLOCK_FACTORS = ("unlock_overhang_60d",)
 CHIP_FACTORS = ("cyq_conc", "cyq_skew")
 ALT_FEATURE_NAMES = ANALYST_FACTORS + UNLOCK_FACTORS + CHIP_FACTORS
@@ -97,6 +108,25 @@ def _revision_series(events: pd.DataFrame, grid: pd.DatetimeIndex) -> Optional[n
     return rev
 
 
+def _fiscal_year_from_quarter(value: Any) -> Optional[int]:
+    """Annual (Q4) forecast year from Tushare ``quarter`` (e.g. ``2026Q4``).
+
+    A broker report usually carries three consecutive annual forecasts
+    (2026Q4 / 2027Q4 / 2028Q4).  Averaging those rows -- the old loader did
+    exactly that -- produces a level that is not a consensus for any year and
+    whose 60-day change is contaminated whenever a report adds/removes a
+    horizon.  Non-annual rows are ignored: Q1/Q2/Q3 forecasts are a different
+    horizon and structurally sparse (2026Q4 ~173k rows vs Q3 ~341).
+    """
+    text = str(value or "").strip().upper()
+    if len(text) != 6 or text[4] != "Q" or text[5] != "4":
+        return None
+    try:
+        return int(text[:4])
+    except ValueError:
+        return None
+
+
 def load_analyst_revision(
     client: MongoClient,
     *,
@@ -105,7 +135,16 @@ def load_analyst_revision(
     start_date: str,
     end_date: str,
 ) -> pd.DataFrame:
-    """``analyst_rev_60d`` per (trade_date, ts_code), NaN without coverage."""
+    """FY1/FY2 annual EPS revision per (trade_date, ts_code), NaN without coverage.
+
+    ``analyst_rev_60d`` is the 60-day revision of the **current fiscal year's**
+    annual consensus (Tushare ``quarter`` = ``YYYYQ4``); ``analyst_rev_fy2_60d``
+    is the next fiscal year. At each trade date ``t`` FY1 is the smallest
+    available forecast year ``>= t.year``, so the series never averages two
+    different forecast horizons. Cross-org aggregation is the median, not the
+    mean: EPS has negative/outlier values and one broker must not move the
+    consensus.
+    """
     empty = pd.DataFrame(columns=["trade_date", "ts_code", *ANALYST_FACTORS])
     start_dt = _parse_day(start_date)
     end_dt = _parse_day(end_date)
@@ -137,19 +176,50 @@ def load_analyst_revision(
         raw = pd.DataFrame(docs)
         raw["date"] = pd.to_datetime(raw["report_date"], format="%Y%m%d", errors="coerce")
         raw["eps"] = pd.to_numeric(raw["eps"], errors="coerce")
-        raw = raw.dropna(subset=["date", "eps"])
+        raw["fiscal_year"] = raw["quarter"].map(_fiscal_year_from_quarter)
+        raw = raw.dropna(subset=["date", "eps", "fiscal_year"])
         if raw.empty:
             continue
-        # One consensus per publication day: the mean across contributing orgs.
-        per_day = raw.groupby(["ts_code", "date"], as_index=False)["eps"].mean()
+        raw["fiscal_year"] = raw["fiscal_year"].astype(int)
+        # One consensus per (publication day, forecast year): median across orgs.
+        per_day = (
+            raw.groupby(["ts_code", "date", "fiscal_year"], as_index=False)["eps"]
+            .median()
+        )
         for code, group in per_day.groupby("ts_code", sort=False):
-            rev = _revision_series(group, grid)
-            if rev is None:
+            fiscal_years = sorted(int(y) for y in group["fiscal_year"].unique())
+            revisions: Dict[int, np.ndarray] = {}
+            for fiscal_year in fiscal_years:
+                events = group[group["fiscal_year"] == fiscal_year][["date", "eps"]]
+                rev = _revision_series(events, grid)
+                if rev is not None:
+                    revisions[fiscal_year] = rev
+            if not revisions:
                 continue
+
+            fy_sorted = np.array(sorted(revisions), dtype=int)
+            matrix = np.column_stack([revisions[fy] for fy in fy_sorted])
+            # FY1 = smallest available annual forecast >= the trade date's year.
+            active = np.searchsorted(fy_sorted, grid.year.to_numpy(), side="left")
+            row = np.arange(len(grid))
+            has_fy1 = active < len(fy_sorted)
+            fy1 = np.where(
+                has_fy1,
+                matrix[row, np.clip(active, 0, len(fy_sorted) - 1)],
+                np.nan,
+            )
+            # FY2 = the next available annual forecast after FY1.
+            has_fy2 = active + 1 < len(fy_sorted)
+            fy2 = np.where(
+                has_fy2,
+                matrix[row, np.clip(active + 1, 0, len(fy_sorted) - 1)],
+                np.nan,
+            )
             frames.append(pd.DataFrame({
                 "trade_date": grid_days,
                 "ts_code": code,
-                "analyst_rev_60d": rev[emit].astype("float64"),
+                "analyst_rev_60d": fy1[emit].astype("float64"),
+                "analyst_rev_fy2_60d": fy2[emit].astype("float64"),
             }))
     if not frames:
         return empty
