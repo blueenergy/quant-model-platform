@@ -112,6 +112,12 @@ FEATURE_SETS: Dict[str, List[str]] = {
     "raw_only_avg_turnover": RAW_ONLY_FEATURES + ["avg_turnover_21d"],
     "raw_only_bias_turn": RAW_ONLY_FEATURES + ["bias_turn_21d_252d"],
     "raw_only_liquidity": RAW_ONLY_FEATURES + ["avg_turnover_21d", "bias_turn_21d_252d"],
+    # Fundamental blocks from export_fundamental_snapshot.py (PIT TTM).
+    "raw_only_value": RAW_ONLY_FEATURES + ["pe_ttm", "pb"],
+    "raw_only_quality": RAW_ONLY_FEATURES + ["roe_ttm", "gpm_ttm"],
+    "raw_only_growth": RAW_ONLY_FEATURES + ["revenue_yoy", "profit_yoy"],
+    "raw_only_fundamentals": RAW_ONLY_FEATURES
+    + ["pe_ttm", "pb", "roe_ttm", "gpm_ttm", "revenue_yoy", "profit_yoy"],
 }
 
 
