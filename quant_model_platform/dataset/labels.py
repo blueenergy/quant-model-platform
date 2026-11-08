@@ -13,6 +13,7 @@ from quant_model_platform.protocol import LABEL_HORIZON_DAYS, LabelNeutralize
 log = logging.getLogger(__name__)
 
 LabelNeutralizeMode = LabelNeutralize
+LabelTransform = Literal["none", "rank", "winsor"]
 
 #: Fewest usable pairs a date needs before its label is residualized on size.
 MIN_SIZE_SAMPLES = 3
@@ -104,8 +105,16 @@ def attach_label_column(
     horizon: int = LABEL_HORIZON_DAYS,
     neutralize: LabelNeutralizeMode = "demean",
     label_col: str = "label_fwd_20d",
+    label_transform: LabelTransform = "none",
+    winsor_quantiles: tuple[float, float] = (0.01, 0.99),
 ) -> pd.DataFrame:
-    """Merge forward return label onto feature panel."""
+    """Merge forward return label onto feature panel.
+
+    ``label_transform`` defaults to ``none`` for backward compatibility. Raw
+    20-day returns contain IPO / limit-up / delisting outliers; ``rank``
+    converts the target to a per-date percentile (the validated research
+    choice) and ``winsor`` clips it at ``winsor_quantiles``.
+    """
     out = panel.copy()
     raw = forward_open_to_open_return(prices, horizon=horizon)
     tmp = prices[["trade_date", "ts_code"]].copy()
@@ -118,5 +127,16 @@ def attach_label_column(
     tmp["label_raw"] = raw
     out = out.merge(tmp, on=["trade_date", "ts_code"], how="left")
     out[label_col] = neutralize_cross_section(out, "label_raw", mode=neutralize)
+    if label_transform == "rank":
+        out[label_col] = (
+            out.groupby("trade_date", sort=False)[label_col].rank(pct=True) - 0.5
+        )
+    elif label_transform == "winsor":
+        low, high = winsor_quantiles
+        out[label_col] = out.groupby("trade_date", sort=False)[label_col].transform(
+            lambda series: series.clip(series.quantile(low), series.quantile(high))
+        )
+    elif label_transform != "none":
+        raise ValueError(f"unknown label_transform: {label_transform}")
     out.drop(columns=["label_raw"], inplace=True)
     return out

@@ -138,3 +138,60 @@ def test_size_neutral_thin_dates_fall_back_to_demean():
     # 20240103 has 3: residuals, not demean (demean would give [-0.1033, -0.0033, 0.1067]).
     thick = got[frame["trade_date"] == "20240103"].tolist()
     assert thick == pytest.approx([0.0016667, -0.0033333, 0.0016667], abs=1e-6)
+
+
+# --- label_transform: rank / winsor ---------------------------------------
+
+
+def test_label_rank_is_a_bounded_per_date_percentile():
+    from quant_model_platform.dataset.labels import attach_label_column
+
+    panel = _panel(DATES, SYMBOLS)
+    prices = _prices(DATES, SYMBOLS)
+    got = attach_label_column(
+        panel, prices, horizon=1, neutralize="none", label_transform="rank"
+    )
+    for _, group in got.groupby("trade_date"):
+        values = group["label_fwd_20d"].dropna()
+        if not values.empty:
+            assert values.between(-0.5, 0.5).all()
+
+    raw = attach_label_column(panel, prices, horizon=1, neutralize="none")
+    merged = raw.merge(
+        got[["trade_date", "ts_code", "label_fwd_20d"]],
+        on=["trade_date", "ts_code"],
+        suffixes=("_raw", "_rank"),
+    ).dropna()
+    for _, group in merged.groupby("trade_date"):
+        if len(group) > 1:
+            assert (
+                group["label_fwd_20d_raw"].rank().tolist()
+                == group["label_fwd_20d_rank"].rank().tolist()
+            )
+
+
+def test_label_winsor_clips_the_extreme_tail():
+    from quant_model_platform.dataset.labels import attach_label_column
+
+    dates = ["20240102", "20240103", "20240104"]
+    symbols = [f"S{i:03d}" for i in range(100)]
+    rows = []
+    for symbol in symbols:
+        for i, date in enumerate(dates):
+            rows.append(
+                {"trade_date": date, "ts_code": symbol, "open": 10.0 * (1.0 + 0.01 * i)}
+            )
+    prices = pd.DataFrame(rows)
+    prices.loc[
+        (prices["ts_code"] == "S000") & (prices["trade_date"] == "20240104"), "open"
+    ] = 60.0
+    panel = _panel(dates, symbols)
+
+    raw = attach_label_column(panel, prices, horizon=1, neutralize="none")
+    clipped = attach_label_column(
+        panel, prices, horizon=1, neutralize="none", label_transform="winsor"
+    )
+    raw_max = raw.loc[raw["trade_date"] == "20240102", "label_fwd_20d"].max()
+    clipped_max = clipped.loc[clipped["trade_date"] == "20240102", "label_fwd_20d"].max()
+    assert raw_max > 1.0
+    assert clipped_max < raw_max

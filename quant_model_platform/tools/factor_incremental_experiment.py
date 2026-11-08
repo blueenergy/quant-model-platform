@@ -130,17 +130,36 @@ def _shift_calendar(date_text: str, days: int) -> str:
     return (datetime.strptime(date_text, "%Y%m%d") + timedelta(days=days)).strftime("%Y%m%d")
 
 
-def _rank_features(frame: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
+def _rank_features(
+    frame: pd.DataFrame,
+    columns: Sequence[str],
+    *,
+    clip_quantile: float = 0.0,
+) -> pd.DataFrame:
     """Per-date cross-sectional percentile rank.
 
     Raw factor levels differ by orders of magnitude across columns; ranking
     each column within a date removes that scale and makes the LightGBM split
     thresholds comparable. NaNs stay NaN so LightGBM can still route them.
+
+    ``clip_quantile`` winsorizes each date before ranking. Financial levels
+    such as PE can reach millions when earnings are near zero; clipping keeps
+    one bad print from defining the top of the cross-section.
     """
     out = frame.copy()
     for column in columns:
-        if column in out.columns:
-            out[column] = out.groupby("trade_date", sort=False)[column].rank(pct=True)
+        if column not in out.columns:
+            continue
+        series = pd.to_numeric(out[column], errors="coerce")
+        if 0.0 < clip_quantile < 0.5:
+            grouped = series.groupby(out["trade_date"], sort=False)
+            series = grouped.transform(
+                lambda values: values.clip(
+                    values.quantile(clip_quantile),
+                    values.quantile(1.0 - clip_quantile),
+                )
+            )
+        out[column] = series.groupby(out["trade_date"], sort=False).rank(pct=True)
     return out
 
 
@@ -315,6 +334,9 @@ def _run_pool(
     lgb_params: Dict[str, Any],
     min_train_rows: int,
     min_test_rows: int,
+    label_transform: str = "none",
+    universe_filter: bool = False,
+    clip_quantile: float = 0.0,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     panel, manifest = build_production_panel(
         index_code=index_code,
@@ -323,6 +345,8 @@ def _run_pool(
         parquet_dir=work_dir / "panel" / index_code,
         config=config,
         client=client,
+        label_transform=label_transform,
+        universe_filter=universe_filter,
     )
     panel["trade_date"] = panel["trade_date"].map(_date)
     panel["ts_code"] = panel["ts_code"].astype(str)
@@ -342,7 +366,7 @@ def _run_pool(
 
     all_features = sorted({name for names in feature_sets.values() for name in names})
     present = [name for name in all_features if name in panel.columns and panel[name].notna().any()]
-    panel = _rank_features(panel, present)
+    panel = _rank_features(panel, present, clip_quantile=clip_quantile)
 
     dates = sorted(panel["trade_date"].unique())
     if windows is None:
@@ -938,6 +962,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--min-test-rows", type=int, default=100)
     parser.add_argument("--num-boost-round", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--label-transform",
+        choices=("none", "rank", "winsor"),
+        default="none",
+        help="Transform the training label per date; rank is the validated choice.",
+    )
+    parser.add_argument(
+        "--universe-filter",
+        action="store_true",
+        help="Drop ST, delisted, too-new, and no-price rows before training.",
+    )
+    parser.add_argument(
+        "--clip-quantile",
+        type=float,
+        default=0.0,
+        help="Winsorize each feature at this quantile per date; 0 disables.",
+    )
     parser.add_argument("--out", default="/tmp/factor_validation/incremental")
     args = parser.parse_args(argv)
 
@@ -1006,6 +1047,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 lgb_params={**lgb_params, "num_boost_round": args.num_boost_round},
                 min_train_rows=args.min_train_rows,
                 min_test_rows=args.min_test_rows,
+                label_transform=args.label_transform,
+                universe_filter=args.universe_filter,
+                clip_quantile=args.clip_quantile,
             )
             all_records.extend(records)
             metas[index_code] = meta
@@ -1051,6 +1095,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "test_days": args.test_days,
                     "purge_days": args.purge_days,
                     "expanding": args.expanding,
+                    "label_transform": args.label_transform,
+                    "universe_filter": args.universe_filter,
+                    "clip_quantile": args.clip_quantile,
                     "min_train_days": args.min_train_days,
                     "top_ks": top_ks,
                     "lgb_params": lgb_params,

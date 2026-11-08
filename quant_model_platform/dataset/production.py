@@ -26,6 +26,10 @@ from quant_model_platform.dataset.raw_factors import (
     derive_daily_basic_factors,
     derive_price_factors,
 )
+from quant_model_platform.dataset.universe import (
+    filter_panel_metadata,
+    filter_panel_prices,
+)
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +87,7 @@ def _flatten_score_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
     row: Dict[str, Any] = {
         "trade_date": _normalize_trade_date(doc.get("score_date")),
         "ts_code": str(doc.get("symbol") or doc.get("ts_code") or "").strip(),
+        "name": str(doc.get("name") or ""),
     }
     if not row["trade_date"] or not row["ts_code"]:
         return {}
@@ -137,6 +142,7 @@ def load_stock_score_rows(
         "_id": 0,
         "symbol": 1,
         "score_date": 1,
+        "name": 1,
         "growth_score": 1,
         "cycle_score": 1,
         "value_score": 1,
@@ -446,6 +452,9 @@ def build_production_panel(
     client: Optional[MongoClient] = None,
     use_canonical_snapshot: bool = False,
     label_neutralize: LabelNeutralize = "demean",
+    label_transform: str = "none",
+    universe_filter: bool = False,
+    min_list_days: int = 250,
 ) -> Tuple[pd.DataFrame, Any]:
     """Build PIT score panel + forward labels; write parquet under parquet_dir.
 
@@ -471,6 +480,18 @@ def build_production_panel(
                 f"(db={cfg.mongo_db})"
             )
         panel = pd.DataFrame(score_rows)
+        if universe_filter:
+            info = pd.DataFrame(
+                list(
+                    mongo[cfg.data_db_name]["stock_info"].find(
+                        {"ts_code": {"$in": panel["ts_code"].unique().tolist()}},
+                        {"_id": 0, "ts_code": 1, "list_date": 1, "delist_date": 1},
+                    )
+                )
+            )
+            panel = filter_panel_metadata(
+                panel, stock_info=info, min_list_days=min_list_days
+            )
         feature_names = registry_names()
         for name in feature_names:
             if name not in panel.columns:
@@ -491,6 +512,10 @@ def build_production_panel(
         )
         if prices.empty:
             raise RuntimeError(f"no volume_price rows in {cfg.data_db_name} for panel symbols")
+        if universe_filter:
+            panel = filter_panel_prices(
+                panel, price_keys=prices.loc[:, ["trade_date", "ts_code"]]
+            )
         panel = _attach_raw_factors(
             mongo,
             panel,
@@ -506,7 +531,12 @@ def build_production_panel(
         # the label silently degrades to demean on every date -- 2026-10-18's
         # first size_neutral build did exactly that, and the guard's warning
         # is what caught it.
-        panel = attach_label_column(panel, prices, neutralize=label_neutralize)
+        panel = attach_label_column(
+            panel,
+            prices,
+            neutralize=label_neutralize,
+            label_transform=label_transform,
+        )
         # Alt-channel loaders carry their own lookback, so they only need the
         # panel window itself (unlike the price factors above).
         panel = _attach_alt_factors(
@@ -532,6 +562,8 @@ def build_production_panel(
         source_revision = (
             f"stock_scores:{cfg.mongo_db}:{index_code}:{start_date}-{end_date}:rawfactors-v1"
             + (f":label-{label_neutralize}" if label_neutralize != "demean" else "")
+            + (f":label-transform-{label_transform}" if label_transform != "none" else "")
+            + (f":universe-filter-{min_list_days}" if universe_filter else "")
         )
         manifest = build_manifest(
             panel,
