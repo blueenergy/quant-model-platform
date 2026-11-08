@@ -79,12 +79,39 @@ ALL_FACTORS = [
     "yoy_roe",
 ]
 
+#: Raw-only baseline: no rule scores. The user wants the model to learn from
+#: explicit PIT quantities instead of inheriting the score's hand-set weights.
+RAW_ONLY_FEATURES = [
+    "momentum_20d",
+    "momentum_60d",
+    "volatility_20d",
+    "turnover_20d",
+    "log_market_cap",
+]
+
+#: Alpha158 representatives, added one at a time. The names must match the
+#: frozen factor snapshot produced by export_factor_snapshot.py.
+ALPHA158_CANDIDATES = ["WVMA30", "MIN10", "CORR10", "KUP", "KLEN"]
+
 FEATURE_SETS: Dict[str, List[str]] = {
     "baseline": BASE_FEATURES,
     "liquidity_pair": BASE_FEATURES + ["avg_turnover_21d", "bias_turn_21d_252d"],
     "liquidity_bias": BASE_FEATURES + ["bias_turn_21d_252d"],
     "novel": BASE_FEATURES + NOVEL_FACTORS,
     "all": BASE_FEATURES + ALL_FACTORS,
+    # Raw-only track: no growth/cycle/value/quality scores.
+    "raw_only": RAW_ONLY_FEATURES,
+    "raw_only_wvma30": RAW_ONLY_FEATURES + ["WVMA30"],
+    "raw_only_min10": RAW_ONLY_FEATURES + ["MIN10"],
+    "raw_only_corr10": RAW_ONLY_FEATURES + ["CORR10"],
+    "raw_only_kup": RAW_ONLY_FEATURES + ["KUP"],
+    "raw_only_klen": RAW_ONLY_FEATURES + ["KLEN"],
+    "raw_only_alpha158_4": RAW_ONLY_FEATURES + ["WVMA30", "MIN10", "CORR10", "KUP"],
+    # Abnormal-turnover pair from the validated factor snapshot. The 2026-10-17
+    # health check found these the only stable new information vs the scores.
+    "raw_only_avg_turnover": RAW_ONLY_FEATURES + ["avg_turnover_21d"],
+    "raw_only_bias_turn": RAW_ONLY_FEATURES + ["bias_turn_21d_252d"],
+    "raw_only_liquidity": RAW_ONLY_FEATURES + ["avg_turnover_21d", "bias_turn_21d_252d"],
 }
 
 
@@ -886,6 +913,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--start", default="20180101")
     parser.add_argument("--end", default="20241231")
     parser.add_argument("--sets", default="baseline,liquidity_pair,liquidity_bias,novel,all")
+    parser.add_argument(
+        "--base-set",
+        default="baseline",
+        help="Feature set used as the comparison baseline; must be one of --sets",
+    )
     parser.add_argument("--train-days", type=int, default=60)
     parser.add_argument("--test-days", type=int, default=20)
     parser.add_argument("--purge-days", type=int, default=60)
@@ -915,8 +947,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ] + [("expanding", None)]
         if not windows:
             parser.error("no training windows")
-    elif "baseline" not in feature_sets:
-        parser.error("baseline must be one of the sets")
+    elif args.base_set not in feature_sets:
+        parser.error(f"--base-set {args.base_set!r} must be one of the --sets")
     index_codes = [value.strip() for value in args.index_codes.split(",") if value.strip()]
     top_ks = [int(value) for value in args.top_k.split(",")]
 
@@ -990,7 +1022,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 aggregates.append(row)
     else:
         for index_code, group in per_fold.groupby("index_code", sort=True):
-            paired = _paired_summary(group, "baseline")
+            paired = _paired_summary(group, args.base_set)
             for row in paired.to_dict(orient="records"):
                 row["index_code"] = index_code
                 row["verdict"] = _verdict(row)
@@ -1005,6 +1037,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "start": args.start,
                     "end": args.end,
                     "sets": selected_sets,
+                    "base_set": args.base_set,
                     "mode": "window_sweep" if args.window_sweep else "feature_sets",
                     "train_windows": args.train_windows if args.window_sweep else None,
                     "reference_window": windows[0][0] if args.window_sweep else None,
