@@ -64,3 +64,29 @@ def filter_panel_prices(
     out = panel.merge(keys, on=["trade_date", "ts_code"], how="left")
     out = out[out["_has_price"].fillna(False)].drop(columns=["_has_price"])
     return out.reset_index(drop=True)
+
+
+def winsorize_features(
+    frame: pd.DataFrame,
+    columns: list[str],
+    *,
+    quantile: float = 0.01,
+) -> pd.DataFrame:
+    """Clip each feature at the per-date ``quantile`` / ``1 - quantile``.
+
+    Financial levels such as PE can reach millions when earnings are near
+    zero; one bad print should not define the top of a cross-section.
+    """
+    if frame.empty or frame["trade_date"].empty or not 0.0 < quantile < 0.5:
+        return frame
+    out = frame.copy()
+    for column in columns:
+        if column not in out.columns:
+            continue
+        values = pd.to_numeric(out[column], errors="coerce")
+        out[column] = values.groupby(out["trade_date"], sort=False).transform(
+            lambda series: series.clip(
+                series.quantile(quantile), series.quantile(1.0 - quantile)
+            )
+        )
+    return out

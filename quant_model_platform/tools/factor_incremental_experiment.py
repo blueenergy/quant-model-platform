@@ -334,9 +334,9 @@ def _run_pool(
     lgb_params: Dict[str, Any],
     min_train_rows: int,
     min_test_rows: int,
-    label_transform: str = "none",
-    universe_filter: bool = False,
-    clip_quantile: float = 0.0,
+    label_transform: str = "rank",
+    universe_filter: bool = True,
+    clip_quantile: float = 0.01,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     panel, manifest = build_production_panel(
         index_code=index_code,
@@ -347,6 +347,7 @@ def _run_pool(
         client=client,
         label_transform=label_transform,
         universe_filter=universe_filter,
+        feature_winsor_quantile=clip_quantile,
     )
     panel["trade_date"] = panel["trade_date"].map(_date)
     panel["ts_code"] = panel["ts_code"].astype(str)
@@ -965,18 +966,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--label-transform",
         choices=("none", "rank", "winsor"),
-        default="none",
+        default="rank",
         help="Transform the training label per date; rank is the validated choice.",
     )
     parser.add_argument(
         "--universe-filter",
-        action="store_true",
-        help="Drop ST, delisted, too-new, and no-price rows before training.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Drop ST, delisted, too-new, and no-price rows (--no-universe-filter disables).",
     )
     parser.add_argument(
         "--clip-quantile",
         type=float,
-        default=0.0,
+        default=0.01,
         help="Winsorize each feature at this quantile per date; 0 disables.",
     )
     parser.add_argument("--out", default="/tmp/factor_validation/incremental")

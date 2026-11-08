@@ -29,6 +29,7 @@ from quant_model_platform.dataset.raw_factors import (
 from quant_model_platform.dataset.universe import (
     filter_panel_metadata,
     filter_panel_prices,
+    winsorize_features,
 )
 
 log = logging.getLogger(__name__)
@@ -452,9 +453,10 @@ def build_production_panel(
     client: Optional[MongoClient] = None,
     use_canonical_snapshot: bool = False,
     label_neutralize: LabelNeutralize = "demean",
-    label_transform: str = "none",
-    universe_filter: bool = False,
+    label_transform: str = "rank",
+    universe_filter: bool = True,
     min_list_days: int = 250,
+    feature_winsor_quantile: float = 0.01,
 ) -> Tuple[pd.DataFrame, Any]:
     """Build PIT score panel + forward labels; write parquet under parquet_dir.
 
@@ -547,6 +549,9 @@ def build_production_panel(
             start_date=start_date,
             end_date=end_date,
         )
+        panel = winsorize_features(
+            panel, feature_names, quantile=feature_winsor_quantile
+        )
         # After the factors, not before: flags computed against the NaN
         # placeholders would call every raw factor missing on every row.
         panel = add_missing_flags(panel, feature_names)
@@ -564,6 +569,7 @@ def build_production_panel(
             + (f":label-{label_neutralize}" if label_neutralize != "demean" else "")
             + (f":label-transform-{label_transform}" if label_transform != "none" else "")
             + (f":universe-filter-{min_list_days}" if universe_filter else "")
+            + (f":winsor-{feature_winsor_quantile}" if feature_winsor_quantile else "")
         )
         manifest = build_manifest(
             panel,
