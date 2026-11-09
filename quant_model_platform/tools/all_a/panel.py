@@ -24,7 +24,6 @@ from quant_model_platform.tools.all_a.config import (
     FEATURES,
     LABEL,
     LIQ_MIN,
-    NAMECHANGE_CSV,
     PANEL_DIR,
     START,
     WARMUP,
@@ -68,7 +67,9 @@ def build_panel(end_date: str, out_dir: Path = PANEL_DIR) -> Path:
     ].drop(columns=["list_dt"]).sort_values(["dt", "ts_code"])
     print("after metadata", len(panel), flush=True)
 
-    nc = pd.read_csv(NAMECHANGE_CSV, dtype=str)
+    nc = pd.DataFrame(list(client[data_db]["name_change"].find(
+        {}, {"_id": 0, "ts_code": 1, "start_date": 1, "name": 1},
+    )))
     nc["start_dt"] = pd.to_datetime(nc["start_date"], format="%Y%m%d", errors="coerce")
     nc = nc.dropna(subset=["start_dt", "ts_code"]).sort_values(["start_dt", "ts_code"])
     first_name = nc.sort_values("start_dt").groupby("ts_code", sort=False)["name"].first().to_dict()
