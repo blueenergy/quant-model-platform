@@ -457,6 +457,7 @@ def build_production_panel(
     universe_filter: bool = True,
     min_list_days: int = 250,
     feature_winsor_quantile: float = 0.01,
+    label_horizon_days: int = 20,
 ) -> Tuple[pd.DataFrame, Any]:
     """Build PIT score panel + forward labels; write parquet under parquet_dir.
 
@@ -533,11 +534,14 @@ def build_production_panel(
         # the label silently degrades to demean on every date -- 2026-10-18's
         # first size_neutral build did exactly that, and the guard's warning
         # is what caught it.
+        label_col = f"label_fwd_{int(label_horizon_days)}d"
         panel = attach_label_column(
             panel,
             prices,
             neutralize=label_neutralize,
             label_transform=label_transform,
+            horizon=int(label_horizon_days),
+            label_col=label_col,
         )
         # Alt-channel loaders carry their own lookback, so they only need the
         # panel window itself (unlike the price factors above).
@@ -570,6 +574,7 @@ def build_production_panel(
             + (f":label-transform-{label_transform}" if label_transform != "none" else "")
             + (f":universe-filter-{min_list_days}" if universe_filter else "")
             + (f":winsor-{feature_winsor_quantile}" if feature_winsor_quantile else "")
+            + (f":label{int(label_horizon_days)}d" if int(label_horizon_days) != 20 else "")
         )
         manifest = build_manifest(
             panel,
