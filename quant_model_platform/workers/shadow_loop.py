@@ -15,13 +15,35 @@ from quant_model_platform.shadow.resolve import load_enabled_shadow_profiles, re
 log = logging.getLogger("model_shadow_loop")
 
 
-def run_all_configured_shadow_batches(config: PlatformConfig) -> list:
+def _profile_labels(profile: dict) -> set:
+    """Names a CLI ``--profile-id`` may match: profile/model id or source job."""
+    labels = set()
+    for key in ("profile_id", "model_id"):
+        value = profile.get(key)
+        if value:
+            labels.add(str(value))
+    params = profile.get("params") or {}
+    for key in ("model_id", "profile_id", "source_job_id"):
+        value = params.get(key)
+        if value:
+            labels.add(str(value))
+    return labels
+
+
+def run_all_configured_shadow_batches(config: PlatformConfig, profile_ids=None) -> list:
     collections = get_ml_collections(config=config)
     profiles = load_enabled_shadow_profiles(collections)
     if not profiles:
         raise RuntimeError(
             "no shadow profiles configured; set MODEL_SHADOW_PROFILES JSON or model_shadow_profiles in Mongo"
         )
+    requested = {str(value) for value in (profile_ids or []) if str(value).strip()}
+    if requested:
+        profiles = [p for p in profiles if requested & _profile_labels(p)]
+        if not profiles:
+            raise RuntimeError(
+                f"no enabled shadow profile matches {sorted(requested)}"
+            )
     summaries = []
     failures = []
     for profile in profiles:
@@ -51,6 +73,12 @@ def main(argv=None) -> int:
     parser.add_argument("--lock-file", default=os.getenv("MODEL_SHADOW_LOCK_FILE", "/tmp/model_shadow_worker.lock"))
     parser.add_argument("--once", action="store_true", help="Run configured shadow profiles once and exit")
     parser.add_argument(
+        "--profile-id",
+        action="append",
+        default=[],
+        help="Run only profiles matching this id/model_id/source_job_id (repeatable)",
+    )
+    parser.add_argument(
         "--synthetic",
         action="store_true",
         help="Dev only: run one synthetic csi1000 batch (ignores MODEL_SHADOW_PROFILES)",
@@ -66,7 +94,7 @@ def main(argv=None) -> int:
         job = queue.claim(args.worker_id)
         if not job:
             try:
-                run_all_configured_shadow_batches(cfg)
+                run_all_configured_shadow_batches(cfg, profile_ids=args.profile_id)
             except Exception:
                 # A stale/retrain-needed profile must not take the continuous
                 # worker down after max_consecutive_failures. --once still
@@ -87,7 +115,7 @@ def main(argv=None) -> int:
         return 0
 
     if args.once:
-        summaries = run_all_configured_shadow_batches(cfg)
+        summaries = run_all_configured_shadow_batches(cfg, profile_ids=args.profile_id)
         log.info("shadow once complete: %s", summaries)
         return 0
 

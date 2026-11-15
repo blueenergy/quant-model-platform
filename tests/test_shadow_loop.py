@@ -58,3 +58,49 @@ def test_shadow_loop_continues_after_one_profile_fails(monkeypatch):
         shadow_loop.run_all_configured_shadow_batches(SimpleNamespace())
 
     assert calls == ["bad", "good"]
+
+
+def test_shadow_loop_filters_profiles_by_model_id(monkeypatch):
+    collections = {}
+    monkeypatch.setattr(shadow_loop, "get_ml_collections", lambda config: collections)
+    monkeypatch.setattr(
+        shadow_loop,
+        "load_enabled_shadow_profiles",
+        lambda cols: [
+            {"profile_id": "live", "model_id": "research-csi1000-clean-raw5"},
+            {"profile_id": "other", "model_id": "promo-hs300"},
+        ],
+    )
+    monkeypatch.setattr(
+        shadow_loop,
+        "resolve_profile_params",
+        lambda profile, cols: {"model_id": profile["model_id"]},
+    )
+    calls = []
+    monkeypatch.setattr(
+        shadow_loop,
+        "run_shadow_batch",
+        lambda params, config, collections=None: calls.append(params["model_id"]) or {},
+    )
+
+    shadow_loop.run_all_configured_shadow_batches(
+        SimpleNamespace(), profile_ids=["research-csi1000-clean-raw5"]
+    )
+
+    assert calls == ["research-csi1000-clean-raw5"]
+
+
+def test_shadow_loop_unknown_profile_filter_fails_loudly(monkeypatch):
+    collections = {}
+    monkeypatch.setattr(shadow_loop, "get_ml_collections", lambda config: collections)
+    monkeypatch.setattr(
+        shadow_loop,
+        "load_enabled_shadow_profiles",
+        lambda cols: [{"profile_id": "live", "model_id": "research-csi1000-clean-raw5"}],
+    )
+    monkeypatch.setattr(shadow_loop, "run_shadow_batch", lambda *a, **k: {})
+
+    with pytest.raises(RuntimeError, match="no enabled shadow profile matches"):
+        shadow_loop.run_all_configured_shadow_batches(
+            SimpleNamespace(), profile_ids=["missing"]
+        )
