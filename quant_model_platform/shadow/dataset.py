@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 from quant_model_platform.dataset.channels import PRODUCTION_CURRENT_CHANNEL
-from quant_model_platform.dataset.production import latest_score_date_for_index
+from quant_model_platform.dataset.production import latest_price_date
 from quant_model_platform.db import COLLECTION_DATASETS, get_ml_client
 from quant_model_platform.storage.s3 import canonical_snapshot_id
 
@@ -47,7 +47,7 @@ def apply_canonical_parquet_resolution(
     params: Dict[str, Any],
     collections: Dict[str, Any],
     *,
-    mongo_db: str,
+    data_db_name: str,
 ) -> Dict[str, Any]:
     mode = _parquet_resolution_mode(params)
     if mode in ("job", "fixed", "false", "0", "off"):
@@ -67,29 +67,29 @@ def apply_canonical_parquet_resolution(
     end_date = str(manifest.get("end_date") or "")
     client = get_ml_client()
     try:
-        latest_scores = latest_score_date_for_index(client, mongo_db=mongo_db, index_code=index_code)
+        latest_prices = latest_price_date(client, data_db_name=data_db_name)
     finally:
         client.close()
-    if latest_scores and end_date:
+    if latest_prices and end_date:
         try:
             end_dt = datetime.strptime(end_date[:8], "%Y%m%d")
-            latest_dt = datetime.strptime(latest_scores[:8], "%Y%m%d")
+            latest_dt = datetime.strptime(latest_prices[:8], "%Y%m%d")
             stale_days = (latest_dt - end_dt).days
             max_stale = _max_stale_calendar_days()
             if stale_days > max_stale:
                 raise RuntimeError(
                     f"canonical snapshot end_date={end_date} is {stale_days} calendar days behind "
-                    f"latest stock_scores={latest_scores} (max_stale={max_stale}); materialize current first"
+                    f"latest volume_price={latest_prices} (max_stale={max_stale}); materialize current first"
                 )
             if stale_days > 0:
                 log.warning(
-                    "canonical end_date=%s behind latest stock_scores=%s by %s day(s)",
+                    "canonical end_date=%s behind latest volume_price=%s by %s day(s)",
                     end_date,
-                    latest_scores,
+                    latest_prices,
                     stale_days,
                 )
         except ValueError:
-            log.warning("could not parse end_date=%s or latest=%s for stale check", end_date, latest_scores)
+            log.warning("could not parse end_date=%s or latest=%s for stale check", end_date, latest_prices)
     p = dict(params)
     p["parquet_path"] = str(path)
     p["snapshot_id"] = manifest.get("snapshot_id") or canonical_snapshot_id(index_code)

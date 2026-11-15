@@ -43,11 +43,15 @@ class _Datasets:
 
 
 def _patch(monkeypatch, tmp_path, datasets):
-    cfg = SimpleNamespace(parquet_root=str(tmp_path), mongo_db="quant_trading")
+    cfg = SimpleNamespace(
+        parquet_root=str(tmp_path),
+        mongo_db="quant_trading",
+        data_db_name="quant_data",
+    )
     client = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr(ms.PlatformConfig, "from_env", classmethod(lambda cls: cfg))
     monkeypatch.setattr(ms, "get_ml_client", lambda c: client)
-    monkeypatch.setattr(ms, "latest_score_date_for_index", lambda *a, **k: "20261014")
+    monkeypatch.setattr(ms, "latest_price_date", lambda *a, **k: "20261014")
     seen = {}
 
     def fake_build(**kwargs):

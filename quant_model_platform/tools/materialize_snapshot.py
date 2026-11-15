@@ -9,7 +9,8 @@ from pathlib import Path
 
 from quant_model_platform.config import PlatformConfig
 from quant_model_platform.dataset.channels import PRODUCTION_CURRENT_CHANNEL
-from quant_model_platform.dataset.production import build_production_panel, latest_score_date_for_index
+from quant_model_platform.dataset.features import FEATURE_REGISTRIES
+from quant_model_platform.dataset.production import build_production_panel, latest_price_date
 from quant_model_platform.db import COLLECTION_DATASETS, get_ml_client, get_ml_collections
 from quant_model_platform.queue import clean_for_mongo
 from quant_model_platform.storage.s3 import canonical_snapshot_id, publish_canonical_local_parquet, publish_local_parquet
@@ -22,18 +23,22 @@ def _resolve_end_date(end_date: str, *, index_code: str, cfg: PlatformConfig) ->
         return end_date
     client = get_ml_client(cfg)
     try:
-        latest = latest_score_date_for_index(client, mongo_db=cfg.mongo_db, index_code=index_code)
+        latest = latest_price_date(client, data_db_name=cfg.data_db_name)
     finally:
         client.close()
     if not latest:
-        raise RuntimeError(f"no stock_scores rows for index={index_code}; cannot resolve --end-date latest")
+        raise RuntimeError(
+            f"no volume_price rows in {cfg.data_db_name}; cannot resolve --end-date latest"
+        )
     log.info("resolved end_date=latest -> %s for index=%s", latest, index_code)
     return latest
 
 
 def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO)
-    parser = argparse.ArgumentParser(description="Materialize ML training snapshot from stock_scores")
+    parser = argparse.ArgumentParser(
+        description="Materialize ML training snapshot from PIT market data"
+    )
     parser.add_argument("--index-code", default="csi1000")
     parser.add_argument("--start-date", required=True, help="YYYYMMDD")
     parser.add_argument("--end-date", required=True, help="YYYYMMDD or latest")
@@ -41,6 +46,24 @@ def main(argv=None) -> int:
     parser.add_argument("--register-mongo", action="store_true", help="Insert/upsert dataset_manifests in quant_ml")
     parser.add_argument("--label-neutralize", choices=["none", "demean", "size_neutral"],
                         default="demean", help="Label neutralization; non-default modes are variant builds (B6e-4)")
+    parser.add_argument(
+        "--universe-source",
+        choices=["index_constituents", "stock_scores"],
+        default="index_constituents",
+        help="Panel base rows: PIT index constituents (default) or legacy stock_scores",
+    )
+    parser.add_argument(
+        "--name-source",
+        choices=["name_change", "stock_info", "index_constituents", "none"],
+        default="name_change",
+        help="Name used by the ST filter; name_change is the PIT default",
+    )
+    parser.add_argument(
+        "--feature-set",
+        choices=sorted(FEATURE_REGISTRIES),
+        default="raw",
+        help="Feature registry: raw (no stock_scores rule scores) or legacy",
+    )
     args = parser.parse_args(argv)
 
     cfg = PlatformConfig.from_env()
@@ -54,6 +77,9 @@ def main(argv=None) -> int:
         config=cfg,
         use_canonical_snapshot=args.canonical,
         label_neutralize=args.label_neutralize,
+        universe_source=args.universe_source,
+        name_source=args.name_source,
+        feature_set=args.feature_set,
     )
     local_path = parquet_dir / (
         f"{args.index_code}_current.parquet"

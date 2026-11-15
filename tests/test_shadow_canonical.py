@@ -48,16 +48,8 @@ def test_apply_canonical_overrides_job_parquet(monkeypatch):
 
     monkeypatch.setattr("quant_model_platform.shadow.dataset.get_ml_client", lambda: _Client())
     monkeypatch.setattr(
-        "quant_model_platform.shadow.dataset.latest_score_date_for_index",
+        "quant_model_platform.shadow.dataset.latest_price_date",
         lambda *args, **kwargs: "20251231",
-    )
-
-    def _fake_latest(*_a, **_k):
-        return "20251231"
-
-    monkeypatch.setattr(
-        "quant_model_platform.shadow.dataset.latest_score_date_for_index",
-        _fake_latest,
     )
     cols = {
         COLLECTION_DATASETS: _MemColl(
@@ -75,7 +67,7 @@ def test_apply_canonical_overrides_job_parquet(monkeypatch):
     out = apply_canonical_parquet_resolution(
         {"index_code": "hs300", "parquet_path": "s3://old/uuid.parquet"},
         cols,
-        mongo_db="finance",
+        data_db_name="quant_data",
     )
     assert out["parquet_path"] == "s3://b/current.parquet"
     assert out["snapshot_id"] == "hs300-current"

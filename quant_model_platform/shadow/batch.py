@@ -25,6 +25,26 @@ def _latest_trade_date(panel: pd.DataFrame) -> str:
     return str(sorted(panel["trade_date"].unique())[-1])
 
 
+def assert_model_features(day: pd.DataFrame, model: Any, model_id: str) -> None:
+    """Refuse to score a model whose declared features the panel cannot supply.
+
+    A panel built without ``stock_scores`` no longer carries the four rule-score
+    columns. An old artifact that still declares them would otherwise be scored
+    on all-NaN inputs and write silent garbage; fail loudly instead so the
+    profile is skipped/retrained, not trusted.
+    """
+    missing = [
+        column
+        for column in model.feature_names
+        if column not in day.columns or not day[column].notna().any()
+    ]
+    if missing:
+        raise ValueError(
+            f"shadow model_id={model_id} requires features not populated in the "
+            f"panel: {missing}; retrain the model or disable this profile"
+        )
+
+
 def run_shadow_batch(params: Dict[str, Any], config: PlatformConfig, *, collections: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     cols = collections or get_ml_collections(config=config)
     merged = merge_job_into_shadow_params(dict(params), cols)
@@ -61,6 +81,7 @@ def run_shadow_batch(params: Dict[str, Any], config: PlatformConfig, *, collecti
     day = panel.loc[panel["trade_date"] == as_of].copy()
     if day.empty:
         raise ValueError(f"no rows for trade_date={as_of}")
+    assert_model_features(day, model, model_id)
     day["score"] = predict_model(day, model)
 
     preds = cols[COLLECTION_PREDICTIONS]

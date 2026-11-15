@@ -23,13 +23,23 @@ def run_all_configured_shadow_batches(config: PlatformConfig) -> list:
             "no shadow profiles configured; set MODEL_SHADOW_PROFILES JSON or model_shadow_profiles in Mongo"
         )
     summaries = []
+    failures = []
     for profile in profiles:
         params = resolve_profile_params(profile, collections)
         name = profile.get("profile_id") or params.get("model_id") or params.get("source_job_id")
         log.info("shadow profile start: %s", name)
-        summary = run_shadow_batch(params, config, collections=collections)
+        try:
+            summary = run_shadow_batch(params, config, collections=collections)
+        except Exception as exc:  # one broken profile must not block the others
+            log.exception("shadow profile failed: %s", name)
+            failures.append({"profile": name, "error": str(exc)})
+            continue
         summaries.append(summary)
         log.info("shadow profile done: %s -> %s", name, summary)
+    if failures:
+        # Still raise so the run is not green, but only after every healthy
+        # profile (notably the live csi1000 one) has written its rows.
+        raise RuntimeError(f"{len(failures)} shadow profile(s) failed: {failures}")
     return summaries
 
 
@@ -55,7 +65,13 @@ def main(argv=None) -> int:
     def step() -> None:
         job = queue.claim(args.worker_id)
         if not job:
-            run_all_configured_shadow_batches(cfg)
+            try:
+                run_all_configured_shadow_batches(cfg)
+            except Exception:
+                # A stale/retrain-needed profile must not take the continuous
+                # worker down after max_consecutive_failures. --once still
+                # exits non-zero so the cron log carries the failure.
+                log.exception("configured shadow batch had failures; worker continues")
             return
         try:
             queue.heartbeat(job["job_id"], "shadow", "predict")

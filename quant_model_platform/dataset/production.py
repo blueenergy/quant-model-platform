@@ -1,4 +1,9 @@
-"""Materialize training panels from production Mongo (stock_scores + volume_price)."""
+"""Materialize training panels from PIT market data.
+
+The default universe source is ``index_constituents`` + ``trade_calendar`` +
+PIT ``name_change``; ``stock_scores`` remains available only as a legacy
+A/B option and is not read by the default path.
+"""
 
 from __future__ import annotations
 
@@ -17,7 +22,12 @@ from quant_model_platform.dataset.alt_factors import (
     load_chip_factors,
     load_unlock_overhang,
 )
-from quant_model_platform.dataset.features import add_missing_flags, registry_names
+from quant_model_platform.dataset.features import (
+    FEATURE_REGISTRIES,
+    add_missing_flags,
+    feature_registry,
+    registry_names,
+)
 from quant_model_platform.dataset.labels import attach_label_column
 from quant_model_platform.dataset.manifest import build_manifest, write_parquet_snapshot
 from quant_model_platform.protocol import LabelNeutralize
@@ -55,6 +65,11 @@ _DAILY_BASIC_PROJECTION = {
     "circ_mv": 1,
     "turnover_rate": 1,
 }
+_INDEX_CONSTITUENTS_COLLECTION = "index_constituents"
+_TRADE_CALENDAR_COLLECTION = "trade_calendar"
+_NAME_CHANGE_COLLECTION = "name_change"
+_PANEL_UNIVERSE_SOURCES = ("index_constituents", "stock_scores")
+_PANEL_NAME_SOURCES = ("name_change", "stock_info", "index_constituents", "none")
 _SYMBOL_CHUNK = 250
 
 #: Panel join key. ``trade_date`` is the normalized ``score_date``; ``ts_code``
@@ -122,6 +137,26 @@ def latest_score_date_for_index(
     return _normalize_trade_date(doc.get("score_date"))
 
 
+def latest_price_date(
+    client: MongoClient,
+    *,
+    data_db_name: str,
+) -> Optional[str]:
+    """Latest trade date available in ``volume_price``.
+
+    This is the panel's date anchor now that the default universe source does
+    not read ``stock_scores``. It is independent of the scoring cadence: at
+    19:15 the day's bars are already in ``volume_price`` even when the scorer
+    has not finished.
+    """
+    doc = client[data_db_name]["volume_price"].find_one(
+        {},
+        {"_id": 0, "trade_date": 1},
+        sort=[("trade_date", -1)],
+    )
+    return _normalize_trade_date((doc or {}).get("trade_date"))
+
+
 def load_stock_score_rows(
     client: MongoClient,
     *,
@@ -157,6 +192,298 @@ def load_stock_score_rows(
         pass
     rows = [_flatten_score_doc(doc) for doc in cursor]
     return [r for r in rows if r]
+
+
+def _trade_calendar_dates(
+    data_db: Any,
+    start_date: str,
+    end_date: str,
+) -> List[str]:
+    """Open SSE trading days in ``[start_date, end_date]``."""
+    cursor = data_db[_TRADE_CALENDAR_COLLECTION].find(
+        {
+            "exchange": "SSE",
+            "is_open": {"$in": [1, "1"]},
+            "trade_date": {"$gte": start_date, "$lte": end_date},
+        },
+        {"_id": 0, "trade_date": 1},
+    ).sort("trade_date", 1)
+    dates: List[str] = []
+    for row in cursor:
+        date = _normalize_trade_date(row.get("trade_date"))
+        if date:
+            dates.append(date)
+    return sorted(set(dates))
+
+
+def select_snapshot_markers(
+    trade_dates: Sequence[str],
+    markers: Sequence[Tuple[str, str]],
+) -> List[Tuple[str, str, str]]:
+    """PIT snapshot selection: ``(trade_date, weight_trade_date, update_date)``.
+
+    A snapshot is usable on trade date T only when both its weight date and its
+    publication date are at/before T. Among usable snapshots, take the most
+    recently published one, then the newest weight date. This is what keeps a
+    weight snapshot published on 2026-11-02 out of the 2026-10-30 panel while
+    still using it on 2026-11-02 itself.
+    """
+    usable_markers = sorted(
+        {(str(weight), str(update)) for weight, update in markers if weight and update}
+    )
+    out: List[Tuple[str, str, str]] = []
+    for trade_date in trade_dates:
+        usable = [
+            (weight, update)
+            for weight, update in usable_markers
+            if weight <= trade_date and update <= trade_date
+        ]
+        if not usable:
+            continue
+        weight, update = max(usable, key=lambda item: (item[1], item[0]))
+        out.append((str(trade_date), weight, update))
+    return out
+
+
+def _load_name_change_names(
+    client: MongoClient,
+    data_db_name: str,
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """PIT name-change table: ``(ts_code, start_dt, name)`` + first-name fallback."""
+    rows = list(
+        client[data_db_name][_NAME_CHANGE_COLLECTION].find(
+            {},
+            {"_id": 0, "ts_code": 1, "start_date": 1, "name": 1},
+        )
+    )
+    if not rows:
+        return pd.DataFrame(columns=["ts_code", "start_dt", "name"]), {}
+    frame = pd.DataFrame(rows)
+    frame["ts_code"] = frame["ts_code"].astype(str)
+    frame["name"] = frame["name"].fillna("").astype(str)
+    frame["start_dt"] = pd.to_datetime(
+        frame["start_date"].astype(str), format="%Y%m%d", errors="coerce"
+    )
+    frame = frame.dropna(subset=["start_dt"]).sort_values(["start_dt", "ts_code"])
+    first_name = (
+        frame.sort_values("start_dt")
+        .groupby("ts_code", sort=False)["name"]
+        .first()
+        .to_dict()
+    )
+    return frame[["ts_code", "start_dt", "name"]], first_name
+
+
+def _apply_universe_names(
+    out: pd.DataFrame,
+    client: MongoClient,
+    data_db_name: str,
+    *,
+    name_source: str,
+) -> pd.DataFrame:
+    """Attach the ``name`` column used by the panel's ST filter."""
+    if name_source not in _PANEL_NAME_SOURCES:
+        raise ValueError(
+            f"unknown name source {name_source!r}; choose one of {list(_PANEL_NAME_SOURCES)}"
+        )
+    if name_source == "none":
+        out = out.copy()
+        out["name"] = ""
+        return out
+    if name_source == "stock_info":
+        info = pd.DataFrame(
+            list(
+                client[data_db_name]["stock_info"].find(
+                    {}, {"_id": 0, "symbol": 1, "name": 1}
+                )
+            )
+        )
+        mapping = (
+            dict(
+                zip(
+                    info["symbol"].astype(str),
+                    info["name"].fillna("").astype(str),
+                )
+            )
+            if not info.empty
+            else {}
+        )
+        out = out.copy()
+        out["name"] = out["ts_code"].astype(str).map(mapping).fillna("")
+        return out
+    if name_source == "index_constituents":
+        out = out.copy()
+        if "name" in out.columns:
+            out["name"] = out["name"].fillna("").astype(str)
+        else:
+            out["name"] = ""
+        return out
+    # name_change: as-of name, falling back to the symbol's first known name.
+    names, first_name = _load_name_change_names(client, data_db_name)
+    out = out.copy()
+    out["dt"] = pd.to_datetime(out["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
+    out = out.sort_values(["dt", "ts_code"])
+    if names.empty:
+        out["name"] = out["ts_code"].astype(str).map(first_name).fillna("")
+    else:
+        out = pd.merge_asof(
+            out,
+            names,
+            left_on="dt",
+            right_on="start_dt",
+            by="ts_code",
+            direction="backward",
+        )
+        out["name"] = (
+            out["name"].fillna(out["ts_code"].astype(str).map(first_name)).fillna("")
+        )
+    return out.drop(columns=["dt", "start_dt"], errors="ignore")
+
+
+def load_index_universe_rows(
+    client: MongoClient,
+    *,
+    data_db_name: str,
+    index_code: str,
+    start_date: str,
+    end_date: str,
+    name_source: str = "name_change",
+) -> List[Dict[str, Any]]:
+    """Panel base rows from ``trade_calendar`` + ``index_constituents``.
+
+    Returns the same shape as :func:`load_stock_score_rows`: one dict per
+    ``(trade_date, ts_code)`` with a ``name`` column. Membership is PIT: the
+    most recently published snapshot whose ``weight_trade_date`` and
+    ``update_date`` are both at/before the trade date.
+
+    ``name_source`` selects the name used by the ST filter in
+    ``filter_panel_metadata``. The production default is ``name_change``
+    (``quant_data.name_change``), which is the true as-of name; the legacy
+    panel used ``stock_scores.name``, i.e. the name at scoring/backfill time.
+    """
+    data_db = client[data_db_name]
+    trade_dates = _trade_calendar_dates(data_db, start_date, end_date)
+    if not trade_dates:
+        return []
+
+    docs = list(
+        data_db[_INDEX_CONSTITUENTS_COLLECTION].find(
+            {"index_code": index_code, "weight_trade_date": {"$lte": end_date}},
+            {
+                "_id": 0,
+                "weight_trade_date": 1,
+                "update_date": 1,
+                "symbol": 1,
+                "name": 1,
+            },
+        )
+    )
+    if not docs:
+        return _load_legacy_index_universe_rows(
+            client,
+            data_db_name=data_db_name,
+            index_code=index_code,
+            trade_dates=trade_dates,
+            end_date=end_date,
+            name_source=name_source,
+        )
+
+    snap = pd.DataFrame(docs)
+    if "name" not in snap.columns:
+        snap["name"] = ""
+    snap["weight_trade_date"] = snap["weight_trade_date"].map(_normalize_trade_date)
+    snap["update_date"] = snap["update_date"].map(_normalize_trade_date)
+    snap["symbol"] = snap["symbol"].fillna("").astype(str).str.strip()
+    snap = snap.dropna(subset=["weight_trade_date", "update_date"])
+    snap = snap[snap["symbol"] != ""]
+    if snap.empty:
+        return []
+
+    assignments = select_snapshot_markers(
+        trade_dates,
+        list(zip(snap["weight_trade_date"], snap["update_date"])),
+    )
+    if not assignments:
+        return []
+
+    member_columns = ["weight_trade_date", "update_date", "symbol"]
+    if name_source == "index_constituents":
+        member_columns.append("name")
+    members = snap[member_columns].drop_duplicates()
+    assign_frame = pd.DataFrame(
+        assignments, columns=["trade_date", "weight_trade_date", "update_date"]
+    )
+    out = assign_frame.merge(
+        members, on=["weight_trade_date", "update_date"], how="inner"
+    )
+    out = out.rename(columns={"symbol": "ts_code"})
+    out = out.drop_duplicates(subset=["trade_date", "ts_code"]).reset_index(drop=True)
+    if out.empty:
+        return []
+    out = _apply_universe_names(
+        out, client, data_db_name, name_source=name_source
+    )
+    return (
+        out[["trade_date", "ts_code", "name"]]
+        .sort_values(["trade_date", "ts_code"])
+        .to_dict("records")
+    )
+
+
+def _load_legacy_index_universe_rows(
+    client: MongoClient,
+    *,
+    data_db_name: str,
+    index_code: str,
+    trade_dates: Sequence[str],
+    end_date: str,
+    name_source: str,
+) -> List[Dict[str, Any]]:
+    """Fallback for docs that predate ``weight_trade_date``: use update_date."""
+    import bisect
+
+    data_db = client[data_db_name]
+    docs = list(
+        data_db[_INDEX_CONSTITUENTS_COLLECTION].find(
+            {"index_code": index_code, "update_date": {"$lte": end_date}},
+            {"_id": 0, "update_date": 1, "symbol": 1, "name": 1},
+        )
+    )
+    if not docs:
+        return []
+    snap = pd.DataFrame(docs)
+    if "name" not in snap.columns:
+        snap["name"] = ""
+    snap["update_date"] = snap["update_date"].map(_normalize_trade_date)
+    snap["symbol"] = snap["symbol"].fillna("").astype(str).str.strip()
+    snap = snap.dropna(subset=["update_date"])
+    snap = snap[snap["symbol"] != ""]
+    if snap.empty:
+        return []
+    dates = sorted(set(snap["update_date"]))
+    assignments = []
+    for trade_date in trade_dates:
+        idx = bisect.bisect_right(dates, trade_date) - 1
+        if idx >= 0:
+            assignments.append((trade_date, dates[idx]))
+    if not assignments:
+        return []
+    member_columns = ["update_date", "symbol"]
+    if name_source == "index_constituents":
+        member_columns.append("name")
+    members = snap[member_columns].drop_duplicates()
+    assign_frame = pd.DataFrame(assignments, columns=["trade_date", "update_date"])
+    out = assign_frame.merge(members, on="update_date", how="inner")
+    out = out.rename(columns={"symbol": "ts_code"})
+    out = out.drop_duplicates(subset=["trade_date", "ts_code"]).reset_index(drop=True)
+    out = _apply_universe_names(
+        out, client, data_db_name, name_source=name_source
+    )
+    return (
+        out[["trade_date", "ts_code", "name"]]
+        .sort_values(["trade_date", "ts_code"])
+        .to_dict("records")
+    )
 
 
 def _load_adj_factors(
@@ -458,30 +785,66 @@ def build_production_panel(
     min_list_days: int = 250,
     feature_winsor_quantile: float = 0.01,
     label_horizon_days: int = 20,
+    universe_source: str = "index_constituents",
+    name_source: str = "name_change",
+    feature_set: str = "raw",
 ) -> Tuple[pd.DataFrame, Any]:
     """Build PIT score panel + forward labels; write parquet under parquet_dir.
+
+    ``universe_source`` defaults to ``index_constituents`` + ``trade_calendar``
+    (no ``stock_scores`` read); pass ``"stock_scores"`` for the legacy A/B path.
+    ``name_source`` selects the ST-filter name (``name_change`` is the PIT
+    default). ``feature_set`` selects ``"raw"`` (no rule-score columns) or
+    ``"legacy"`` (the original registry).
 
     ``label_neutralize`` defaults to the production demean; pass
     ``"size_neutral"`` to residualize the label against ``log_market_cap``
     (the B6e-4 style check). Non-default modes are recorded in
     ``source_revision`` so a variant artifact cannot read as production.
     """
+    if universe_source not in _PANEL_UNIVERSE_SOURCES:
+        raise ValueError(
+            f"unknown universe source {universe_source!r}; choose one of {list(_PANEL_UNIVERSE_SOURCES)}"
+        )
+    if name_source not in _PANEL_NAME_SOURCES:
+        raise ValueError(
+            f"unknown name source {name_source!r}; choose one of {list(_PANEL_NAME_SOURCES)}"
+        )
+    if feature_set not in FEATURE_REGISTRIES:
+        raise ValueError(
+            f"unknown feature set {feature_set!r}; choose one of {sorted(FEATURE_REGISTRIES)}"
+        )
     cfg = config or PlatformConfig.from_env()
     own_client = client is None
     mongo = client or MongoClient(cfg.mongo_uri, tz_aware=True)
     try:
-        score_rows = load_stock_score_rows(
-            mongo,
-            mongo_db=cfg.mongo_db,
-            index_code=index_code,
-            start_date=start_date,
-            end_date=end_date,
-        )
-        if not score_rows:
-            raise RuntimeError(
-                f"no stock_scores rows for index={index_code} between {start_date} and {end_date} "
-                f"(db={cfg.mongo_db})"
+        if universe_source == "stock_scores":
+            score_rows = load_stock_score_rows(
+                mongo,
+                mongo_db=cfg.mongo_db,
+                index_code=index_code,
+                start_date=start_date,
+                end_date=end_date,
             )
+            if not score_rows:
+                raise RuntimeError(
+                    f"no stock_scores rows for index={index_code} between {start_date} and {end_date} "
+                    f"(db={cfg.mongo_db})"
+                )
+        else:
+            score_rows = load_index_universe_rows(
+                mongo,
+                data_db_name=cfg.data_db_name,
+                index_code=index_code,
+                start_date=start_date,
+                end_date=end_date,
+                name_source=name_source,
+            )
+            if not score_rows:
+                raise RuntimeError(
+                    f"no index_constituents/trade_calendar rows for index={index_code} "
+                    f"between {start_date} and {end_date} (db={cfg.data_db_name})"
+                )
         panel = pd.DataFrame(score_rows)
         if universe_filter:
             info = pd.DataFrame(
@@ -495,7 +858,7 @@ def build_production_panel(
             panel = filter_panel_metadata(
                 panel, stock_info=info, min_list_days=min_list_days
             )
-        feature_names = registry_names()
+        feature_names = registry_names(feature_registry(feature_set))
         for name in feature_names:
             if name not in panel.columns:
                 panel[name] = float("nan")
@@ -568,8 +931,20 @@ def build_production_panel(
         # The suffix separates snapshots that share a window but not a feature
         # set. Without it, provenance for the raw-factor panel would read
         # identically to the scores-only one it replaced.
+        if universe_source == "index_constituents":
+            source_prefix = (
+                f"index_constituents:{cfg.data_db_name}:{index_code}:{start_date}-{end_date}"
+                f":{name_source}:{feature_set}"
+            )
+            pit_policy = "index_constituents.weight_trade_date"
+        else:
+            source_prefix = (
+                f"stock_scores:{cfg.mongo_db}:{index_code}:{start_date}-{end_date}"
+                f":rawfactors-v1:{feature_set}"
+            )
+            pit_policy = "stock_scores.index_codes"
         source_revision = (
-            f"stock_scores:{cfg.mongo_db}:{index_code}:{start_date}-{end_date}:rawfactors-v1"
+            source_prefix
             + (f":label-{label_neutralize}" if label_neutralize != "demean" else "")
             + (f":label-transform-{label_transform}" if label_transform != "none" else "")
             + (f":universe-filter-{min_list_days}" if universe_filter else "")
@@ -583,7 +958,7 @@ def build_production_panel(
             end_date=str(end_date)[:8],
             parquet_path=path,
             source_revision=source_revision,
-            pit_policy="stock_scores.index_codes",
+            pit_policy=pit_policy,
             use_canonical_snapshot=use_canonical_snapshot,
         )
         log.info(
@@ -601,8 +976,11 @@ def build_production_panel(
 
 __all__ = [
     "build_production_panel",
+    "latest_price_date",
     "latest_score_date_for_index",
     "load_daily_basic",
+    "load_index_universe_rows",
     "load_price_history",
     "load_stock_score_rows",
+    "select_snapshot_markers",
 ]

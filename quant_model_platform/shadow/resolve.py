@@ -47,7 +47,9 @@ def merge_job_into_shadow_params(params: Dict[str, Any], collections: Dict[str, 
     p.setdefault("model_id", f"promo-{index_code}-{_short_job_id(str(job_id))}")
     p["source_job_id"] = str(job_id)
     cfg = PlatformConfig.from_env()
-    return apply_canonical_parquet_resolution(p, collections, mongo_db=cfg.mongo_db)
+    return apply_canonical_parquet_resolution(
+        p, collections, data_db_name=cfg.data_db_name
+    )
 
 
 def load_shadow_profiles_from_env() -> List[Dict[str, Any]]:

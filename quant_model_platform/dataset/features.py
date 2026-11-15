@@ -47,6 +47,39 @@ DEFAULT_FEATURE_REGISTRY: List[FeatureSpec] = [
 ]
 
 
+#: Registry for panels built without ``stock_scores``. The four rule-score
+#: columns are gone; what remains is the raw price/fundamental set plus the
+#: alternative channels (analyst / unlock / chip), none of which read
+#: ``finance.stock_scores``.
+RAW_FEATURE_REGISTRY: List[FeatureSpec] = [
+    FeatureSpec("momentum_20d", source="prices"),
+    FeatureSpec("momentum_60d", source="prices"),
+    FeatureSpec("volatility_20d", source="prices"),
+    FeatureSpec("turnover_20d", source="fundamentals"),
+    FeatureSpec("log_market_cap", source="fundamentals"),
+    FeatureSpec("analyst_rev_60d", source="earnings_report_rc"),
+    FeatureSpec("analyst_rev_fy2_60d", source="earnings_report_rc"),
+    FeatureSpec("unlock_overhang_60d", source="share_float"),
+    FeatureSpec("cyq_conc", source="cyq_perf"),
+    FeatureSpec("cyq_skew", source="cyq_perf"),
+]
+
+FEATURE_REGISTRIES = {
+    "legacy": DEFAULT_FEATURE_REGISTRY,
+    "raw": RAW_FEATURE_REGISTRY,
+}
+
+
+def feature_registry(name: str) -> List[FeatureSpec]:
+    """Resolve a panel feature set by name."""
+    key = str(name or "legacy").strip().lower()
+    if key not in FEATURE_REGISTRIES:
+        raise ValueError(
+            f"unknown feature set {name!r}; choose one of {sorted(FEATURE_REGISTRIES)}"
+        )
+    return FEATURE_REGISTRIES[key]
+
+
 def registry_names(registry: Sequence[FeatureSpec] | None = None) -> List[str]:
     reg = list(registry or DEFAULT_FEATURE_REGISTRY)
     return [f.name for f in reg]

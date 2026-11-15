@@ -42,6 +42,9 @@ def load_training_panel(
             end_date=end_date,
             parquet_dir=parquet_root / "snapshots",
             config=cfg,
+            universe_source=str(params.get("universe_source") or "index_constituents"),
+            name_source=str(params.get("name_source") or "name_change"),
+            feature_set=str(params.get("feature_set") or "raw"),
         )
         snapshot_id = manifest.snapshot_id
         local_path = parquet_root / "snapshots" / f"{index_code}_production_{start_date}_{end_date}.parquet"
