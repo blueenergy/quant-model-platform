@@ -7,6 +7,7 @@ import logging
 import os
 
 from quant_model_platform.config import PlatformConfig
+from quant_model_platform.dataset.production import latest_price_date
 from quant_model_platform.db import COLLECTION_SHADOW_JOBS, ensure_ml_indexes, get_ml_collections
 from quant_model_platform.queue import JobQueue, WorkerLockHeld, install_shutdown_handlers, run_worker_forever, worker_lock
 from quant_model_platform.shadow.batch import run_shadow_batch
@@ -66,7 +67,14 @@ def run_all_configured_shadow_batches(config: PlatformConfig, profile_ids=None) 
         summaries.append(summary)
         log.info("shadow profile done: %s -> %s", name, summary)
     try:
-        health = refresh_model_health(collections)
+        latest_market_date = latest_price_date(
+            collections["db"].client,
+            data_db_name=config.data_db_name,
+        )
+        health = refresh_model_health(
+            collections,
+            latest_market_date=latest_market_date,
+        )
         log.info("model registry health refreshed: %s", health)
     except Exception:
         # Health refresh is observational; never let it fail the prediction run.

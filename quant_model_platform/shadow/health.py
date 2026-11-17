@@ -73,15 +73,27 @@ def _stale_days(latest_market_date: str | None, last_prediction_date: str | None
         return None
 
 
-def refresh_model_health(collections: Dict[str, Any]) -> Dict[str, Any]:
-    """Recompute health for every registry model; return active-stale count."""
+def refresh_model_health(
+    collections: Dict[str, Any],
+    *,
+    latest_market_date: str | None = None,
+) -> Dict[str, Any]:
+    """Recompute health for every registry model; return active-stale count.
+
+    ``latest_market_date`` should come from ``volume_price`` (the actual
+    trading calendar). Falling back to the max prediction date would hide a
+    total shadow outage: every model would look "current" relative to the
+    stale prediction clock.
+    """
     models = collections.get(COLLECTION_MODELS)
     preds = collections.get(COLLECTION_PREDICTIONS)
     if models is None or preds is None:
         return {"checked": 0, "active_stale": 0}
 
-    latest_doc = preds.find_one({}, {"trade_date": 1}, sort=[("trade_date", -1)])
-    latest_market_date = str((latest_doc or {}).get("trade_date") or "") or None
+    if latest_market_date is None:
+        latest_doc = preds.find_one({}, {"trade_date": 1}, sort=[("trade_date", -1)])
+        latest_market_date = str((latest_doc or {}).get("trade_date") or "") or None
+    latest_market_date = str(latest_market_date or "") or None
     docs = list(models.find({}, {"model_id": 1, "state": 1, "health": 1}))
     active_stale = 0
     now = utcnow()
