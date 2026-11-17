@@ -12,6 +12,7 @@ from quant_model_platform.config import PlatformConfig
 from quant_model_platform.db import COLLECTION_JOBS, COLLECTION_RESULTS, get_ml_collections
 from quant_model_platform.queue import HeartbeatTicker, JobQueue, clean_for_mongo
 from quant_model_platform.training.pipeline import run_training_job
+from quant_model_platform.training.registry import register_trained_model
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +42,11 @@ def process_model_training_job(
         }
         collections[COLLECTION_RESULTS].insert_one(clean_for_mongo(result_doc))
         queue.complete(job_id, result_id=result["result_id"])
+        try:
+            register_trained_model(collections, job, result_doc)
+        except Exception:
+            # A registry write failure must not undo a completed training job.
+            log.exception("model registry registration failed job_id=%s", job_id)
         return {"status": "completed", "job_id": job_id, "result_id": result["result_id"]}
     except Exception as exc:
         log.exception("model training job failed job_id=%s", job_id)

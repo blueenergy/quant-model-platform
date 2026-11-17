@@ -10,6 +10,7 @@ from quant_model_platform.config import PlatformConfig
 from quant_model_platform.db import COLLECTION_SHADOW_JOBS, ensure_ml_indexes, get_ml_collections
 from quant_model_platform.queue import JobQueue, WorkerLockHeld, install_shutdown_handlers, run_worker_forever, worker_lock
 from quant_model_platform.shadow.batch import run_shadow_batch
+from quant_model_platform.shadow.registry_sync import sync_shadow_profile_states
 from quant_model_platform.shadow.resolve import load_enabled_shadow_profiles, resolve_profile_params
 
 log = logging.getLogger("model_shadow_loop")
@@ -32,6 +33,11 @@ def _profile_labels(profile: dict) -> set:
 
 def run_all_configured_shadow_batches(config: PlatformConfig, profile_ids=None) -> list:
     collections = get_ml_collections(config=config)
+    try:
+        sync_shadow_profile_states(collections)
+    except Exception:
+        # Profile sync must not block today's predictions; the next run retries.
+        log.exception("shadow registry sync failed")
     profiles = load_enabled_shadow_profiles(collections)
     if not profiles:
         raise RuntimeError(

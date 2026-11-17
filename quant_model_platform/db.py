@@ -14,6 +14,7 @@ COLLECTION_DATASETS = "dataset_manifests"
 COLLECTION_PREDICTIONS = "model_predictions"
 COLLECTION_SHADOW_JOBS = "model_shadow_jobs"
 COLLECTION_SHADOW_PROFILES = "model_shadow_profiles"
+COLLECTION_MODELS = "models"
 COLLECTION_WORKER_STATUS = "model_training_worker_status"
 
 _CHANNEL_INDEX = "index_code_1_channel_1"
@@ -37,6 +38,7 @@ def get_ml_collections(client: MongoClient | None = None, config: PlatformConfig
         COLLECTION_PREDICTIONS: db[COLLECTION_PREDICTIONS],
         COLLECTION_SHADOW_JOBS: db[COLLECTION_SHADOW_JOBS],
         COLLECTION_SHADOW_PROFILES: db[COLLECTION_SHADOW_PROFILES],
+        COLLECTION_MODELS: db[COLLECTION_MODELS],
         COLLECTION_WORKER_STATUS: db[COLLECTION_WORKER_STATUS],
     }
 
@@ -67,3 +69,8 @@ def ensure_ml_indexes(collections: Dict[str, Any]) -> None:
     profiles = collections.get(COLLECTION_SHADOW_PROFILES)
     if profiles is not None:
         profiles.create_index([("profile_id", ASCENDING)], unique=True)
+    models = collections.get(COLLECTION_MODELS)
+    if models is not None:
+        models.create_index([("state", ASCENDING)])
+        models.create_index([("family_id", ASCENDING)])
+        models.create_index([("index_code", ASCENDING)])
