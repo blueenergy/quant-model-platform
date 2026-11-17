@@ -10,6 +10,7 @@ from quant_model_platform.config import PlatformConfig
 from quant_model_platform.db import COLLECTION_SHADOW_JOBS, ensure_ml_indexes, get_ml_collections
 from quant_model_platform.queue import JobQueue, WorkerLockHeld, install_shutdown_handlers, run_worker_forever, worker_lock
 from quant_model_platform.shadow.batch import run_shadow_batch
+from quant_model_platform.shadow.health import refresh_model_health
 from quant_model_platform.shadow.registry_sync import sync_shadow_profile_states
 from quant_model_platform.shadow.resolve import load_enabled_shadow_profiles, resolve_profile_params
 
@@ -64,6 +65,12 @@ def run_all_configured_shadow_batches(config: PlatformConfig, profile_ids=None) 
             continue
         summaries.append(summary)
         log.info("shadow profile done: %s -> %s", name, summary)
+    try:
+        health = refresh_model_health(collections)
+        log.info("model registry health refreshed: %s", health)
+    except Exception:
+        # Health refresh is observational; never let it fail the prediction run.
+        log.exception("model registry health refresh failed")
     if failures:
         # Still raise so the run is not green, but only after every healthy
         # profile (notably the live csi1000 one) has written its rows.
