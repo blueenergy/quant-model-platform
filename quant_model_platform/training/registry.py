@@ -18,6 +18,8 @@ from quant_model_platform.timeutil import utcnow
 log = logging.getLogger(__name__)
 
 _HEX_SUFFIX = re.compile(r"^[0-9a-f]{8}$", re.IGNORECASE)
+_DATE_SUFFIX = re.compile(r"^[0-9]{6,8}$")
+_VERSION_SUFFIX = re.compile(r"^v[0-9]+$", re.IGNORECASE)
 
 
 def _family_id(model_id: str, params: Dict[str, Any]) -> str:
@@ -30,7 +32,11 @@ def _family_id(model_id: str, params: Dict[str, Any]) -> str:
             text = text[len(prefix):]
             break
     parts = text.split("-")
-    while parts and (_HEX_SUFFIX.match(parts[-1]) or (len(parts[-1]) == 8 and parts[-1].isdigit())):
+    while parts and (
+        _HEX_SUFFIX.match(parts[-1])
+        or _DATE_SUFFIX.match(parts[-1])
+        or _VERSION_SUFFIX.match(parts[-1])
+    ):
         parts.pop()
     return "-".join(parts) or model_id
 

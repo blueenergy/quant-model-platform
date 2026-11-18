@@ -17,6 +17,12 @@ def main(argv=None) -> int:
     parser.add_argument("--profile-id", required=True)
     parser.add_argument("--source-job-id", required=True)
     parser.add_argument("--model-id", default="", help="Override default promo-{index}-{short_job}")
+    parser.add_argument(
+        "--use-saved-artifact",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Load the promoted job's artifact (default); use --no-use-saved-artifact to refit full-sample each run.",
+    )
     parser.add_argument("--disable", action="store_true")
     args = parser.parse_args(argv)
 
@@ -25,6 +31,12 @@ def main(argv=None) -> int:
     merged = merge_job_into_shadow_params({"source_job_id": args.source_job_id}, collections)
     if args.model_id:
         merged["model_id"] = args.model_id
+    if args.use_saved_artifact and not merged.get("artifact_uri"):
+        raise SystemExit(
+            f"source job {args.source_job_id} has no artifact_uri; cannot use_saved_artifact"
+        )
+    params = dict(merged)
+    params["use_saved_artifact"] = bool(args.use_saved_artifact)
     doc = clean_for_mongo(
         {
             "profile_id": args.profile_id,
@@ -32,14 +44,7 @@ def main(argv=None) -> int:
             "model_id": merged.get("model_id"),
             "index_code": merged.get("index_code"),
             "enabled": not args.disable,
-            "params": {
-                "source_job_id": args.source_job_id,
-                "model_id": merged.get("model_id"),
-                "index_code": merged.get("index_code"),
-                "parquet_path": merged.get("parquet_path"),
-                "snapshot_id": merged.get("snapshot_id"),
-                "model_kind": merged.get("model_kind"),
-            },
+            "params": params,
             "updated_at": utcnow(),
         }
     )
