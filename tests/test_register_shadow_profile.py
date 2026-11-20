@@ -80,3 +80,61 @@ def test_register_profile_requires_artifact_when_using_saved_artifact(monkeypatc
     )
     with pytest.raises(SystemExit):
         tool.main(["--profile-id", "p1", "--source-job-id", "job-1"])
+
+
+def test_register_profile_merges_walk_forward_params(monkeypatch):
+    """A walk-forward profile carries its own recipe; the job only lends features.
+
+    The source job exists to supply feature names and booster params -- its
+    artifact is deliberately bypassed. If ``--params-json`` were applied before
+    the job merge, or dropped, the profile would silently fall back to the
+    full-sample artifact and the shadow would score a different model.
+    """
+    profiles = _patch(
+        monkeypatch,
+        {
+            "source_job_id": "job-1",
+            "model_id": "job-derived",
+            "index_code": "csi1000",
+            "artifact_uri": "/data/artifact.joblib",
+            "parquet_path": "/data/job-panel.parquet",
+            "feature_names": ["momentum_20d", "volatility_20d"],
+            "model_params": {"num_leaves": 15},
+        },
+    )
+    tool.main([
+        "--profile-id", "p-wf",
+        "--source-job-id", "job-1",
+        "--model-id", "wf-model",
+        "--no-use-saved-artifact",
+        "--params-json",
+        '{"train_mode":"walk_forward_expanding","train_end_offset_days":21,'
+        '"parquet_path":"/data/snapshots/csi1000_current.parquet",'
+        '"snapshot_id":"csi1000-current"}',
+    ])
+    params = profiles.docs[0]["params"]
+    assert profiles.docs[0]["model_id"] == "wf-model"
+    assert params["train_mode"] == "walk_forward_expanding"
+    assert params["train_end_offset_days"] == 21
+    # Overrides win over the job's values; the job's features survive.
+    assert params["parquet_path"] == "/data/snapshots/csi1000_current.parquet"
+    assert params["feature_names"] == ["momentum_20d", "volatility_20d"]
+    assert params["use_saved_artifact"] is False
+
+
+def test_register_profile_rejects_non_object_params_json(monkeypatch):
+    _patch(
+        monkeypatch,
+        {
+            "source_job_id": "job-1",
+            "model_id": "model-1",
+            "index_code": "csi1000",
+            "artifact_uri": "/data/artifact.joblib",
+        },
+    )
+    with pytest.raises(SystemExit):
+        tool.main([
+            "--profile-id", "p1",
+            "--source-job-id", "job-1",
+            "--params-json", '["not", "an", "object"]',
+        ])

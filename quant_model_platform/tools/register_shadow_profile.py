@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from quant_model_platform.timeutil import utcnow
 
@@ -24,11 +25,24 @@ def main(argv=None) -> int:
         help="Load the promoted job's artifact (default); use --no-use-saved-artifact to refit full-sample each run.",
     )
     parser.add_argument("--disable", action="store_true")
+    parser.add_argument(
+        "--params-json",
+        default="",
+        help=(
+            "JSON object merged over the source job's params, for a profile that "
+            "does not deploy the job's artifact (e.g. train_mode=walk_forward_expanding)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     collections = get_ml_collections()
     ensure_ml_indexes(collections)
     merged = merge_job_into_shadow_params({"source_job_id": args.source_job_id}, collections)
+    if args.params_json:
+        extra = json.loads(args.params_json)
+        if not isinstance(extra, dict):
+            raise SystemExit("--params-json must be a JSON object")
+        merged.update(extra)
     if args.model_id:
         merged["model_id"] = args.model_id
     if args.use_saved_artifact and not merged.get("artifact_uri"):
