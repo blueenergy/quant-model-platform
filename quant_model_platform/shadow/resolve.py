@@ -35,6 +35,10 @@ def merge_job_into_shadow_params(params: Dict[str, Any], collections: Dict[str, 
         "data_source",
         "start_date",
         "end_date",
+        "train_mode",
+        "train_end_offset_days",
+        "signal_date",
+        "drop_incomplete_features",
     ):
         if key not in p and key in jp:
             p[key] = jp[key]
