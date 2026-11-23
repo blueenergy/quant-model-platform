@@ -11,7 +11,11 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from quant_model_platform.config import PlatformConfig
-from quant_model_platform.db import COLLECTION_PREDICTIONS, get_ml_collections
+from quant_model_platform.db import (
+    COLLECTION_PREDICTION_SETS,
+    COLLECTION_PREDICTIONS,
+    get_ml_collections,
+)
 from quant_model_platform.shadow.resolve import merge_job_into_shadow_params
 from quant_model_platform.training.artifacts import load_trained_model
 from quant_model_platform.training.fit import fit_full_sample_model
@@ -73,6 +77,42 @@ def run_shadow_batch(params: Dict[str, Any], config: PlatformConfig, *, collecti
     model_id = str(merged.get("model_id") or f"shadow-{index_code}")
     label_col = str(merged.get("label_col", "label_fwd_20d"))
     parquet_root = Path(config.parquet_root)
+
+    # Every shadow row must belong to a registered prediction set. Resolve it
+    # from the profile override or the single active shadow set for the model;
+    # refusing here prevents new rows from silently escaping the registry.
+    prediction_set_id = str(merged.get("prediction_set_id") or "").strip()
+    prediction_sets = cols.get(COLLECTION_PREDICTION_SETS)
+    if prediction_sets is None:
+        # Test doubles and pre-registry deployments: keep the writer usable
+        # with a deterministic id; production always supplies the registry.
+        prediction_set_id = prediction_set_id or f"ps-shadow-{model_id}"
+    elif not prediction_set_id:
+        candidates = list(
+            prediction_sets.find(
+                {"model_id": model_id, "kind": "shadow", "status": "active"}
+            )
+        )
+        if len(candidates) != 1:
+            raise ValueError(
+                f"shadow model_id={model_id} has {len(candidates)} active shadow "
+                "prediction sets; expected exactly one"
+            )
+        prediction_set_id = str(
+            candidates[0].get("prediction_set_id") or candidates[0].get("_id") or ""
+        )
+    else:
+        set_doc = prediction_sets.find_one({"_id": prediction_set_id}) or {}
+        if (
+            not set_doc
+            or str(set_doc.get("status") or "") != "active"
+            or str(set_doc.get("kind") or "") != "shadow"
+            or str(set_doc.get("model_id") or model_id) != model_id
+        ):
+            raise ValueError(
+                f"shadow prediction_set_id={prediction_set_id} is not an active "
+                f"shadow set for model_id={model_id}"
+            )
 
     panel, snapshot_id, canonical_path = load_training_panel(merged, parquet_root=parquet_root, config=config)
     merged.setdefault("snapshot_id", snapshot_id)
@@ -147,6 +187,7 @@ def run_shadow_batch(params: Dict[str, Any], config: PlatformConfig, *, collecti
         record = {
             "prediction_id": str(uuid.uuid4()),
             "model_id": model_id,
+            "prediction_set_id": prediction_set_id,
             "snapshot_id": merged.get("snapshot_id", snapshot_id),
             "source_job_id": merged.get("source_job_id"),
             "index_code": index_code,
@@ -163,6 +204,7 @@ def run_shadow_batch(params: Dict[str, Any], config: PlatformConfig, *, collecti
 
     summary = {
         "model_id": model_id,
+        "prediction_set_id": prediction_set_id,
         "index_code": index_code,
         "trade_date": as_of,
         "snapshot_id": merged.get("snapshot_id"),
