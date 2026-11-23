@@ -12,7 +12,11 @@ import math
 from datetime import datetime
 from typing import Any, Dict, List
 
-from quant_model_platform.db import COLLECTION_MODELS, COLLECTION_PREDICTIONS
+from quant_model_platform.db import (
+    COLLECTION_MODELS,
+    COLLECTION_PREDICTION_SETS,
+    COLLECTION_PREDICTIONS,
+)
 from quant_model_platform.timeutil import utcnow
 
 log = logging.getLogger(__name__)
@@ -73,6 +77,147 @@ def _stale_days(latest_market_date: str | None, last_prediction_date: str | None
         return None
 
 
+def refresh_prediction_set_registry(collections: Dict[str, Any]) -> Dict[str, Any]:
+    """Recompute every prediction set's stats and derive model summaries.
+
+    The set registry is the identity source; ``models.prediction_sets`` is a
+    denormalized summary that the factory UI reads. Shadow runs append rows
+    daily, so both have to be refreshed from ``model_predictions`` rather than
+    hand-maintained.
+    """
+    sets = collections.get(COLLECTION_PREDICTION_SETS)
+    preds = collections.get(COLLECTION_PREDICTIONS)
+    models = collections.get(COLLECTION_MODELS)
+    if sets is None or preds is None or models is None:
+        return {"sets": 0, "models": 0, "overlaps": 0}
+
+    summaries: Dict[str, List[Dict[str, Any]]] = {}
+    refreshed = 0
+    overlaps: List[str] = []
+    now = utcnow()
+    for doc in sets.find({}):
+        set_id = str(doc.get("prediction_set_id") or doc.get("_id") or "")
+        model_id = str(doc.get("model_id") or "")
+        if not set_id or not model_id:
+            continue
+        dates = sorted(
+            str(value)
+            for value in (preds.distinct("trade_date", {"prediction_set_id": set_id}) or [])
+            if value
+        )
+        prediction_count = int(
+            preds.count_documents({"prediction_set_id": set_id}) or 0
+        )
+        segment_rows = list(
+            preds.aggregate(
+                [
+                    {"$match": {"prediction_set_id": set_id}},
+                    {
+                        "$group": {
+                            "_id": {"source": "$source", "window": "$window"},
+                            "first_trade_date": {"$min": "$trade_date"},
+                            "last_trade_date": {"$max": "$trade_date"},
+                            "prediction_count": {"$sum": 1},
+                            "dates": {"$addToSet": "$trade_date"},
+                        }
+                    },
+                    {"$sort": {"first_trade_date": 1}},
+                ]
+            )
+        )
+        segments = [
+            {
+                "source": (row.get("_id") or {}).get("source"),
+                "window": (row.get("_id") or {}).get("window"),
+                "first_trade_date": row.get("first_trade_date"),
+                "last_trade_date": row.get("last_trade_date"),
+                "date_count": len(row.get("dates") or []),
+                "prediction_count": int(row.get("prediction_count") or 0),
+            }
+            for row in segment_rows
+        ]
+        first_trade_date = dates[0] if dates else None
+        last_trade_date = dates[-1] if dates else None
+        sets.update_one(
+            {"_id": doc.get("_id")},
+            {
+                "$set": {
+                    "prediction_set_id": set_id,
+                    "first_trade_date": first_trade_date,
+                    "last_trade_date": last_trade_date,
+                    "date_count": len(dates),
+                    "prediction_count": prediction_count,
+                    "source_segments": segments,
+                    "updated_at": now,
+                }
+            },
+        )
+        summaries.setdefault(model_id, []).append(
+            {
+                "prediction_set_id": set_id,
+                "kind": doc.get("kind"),
+                "status": doc.get("status") or "active",
+                "source": segments[0].get("source") if segments else doc.get("source"),
+                "window": doc.get("window") or (segments[0].get("window") if segments else None),
+                "first_trade_date": first_trade_date,
+                "last_trade_date": last_trade_date,
+                "date_count": len(dates),
+                "prediction_count": prediction_count,
+                "source_segments": segments,
+            }
+        )
+        refreshed += 1
+
+    for model_id, rows in summaries.items():
+        rows.sort(
+            key=lambda row: (
+                row["status"] != "active",
+                str(row.get("kind") or ""),
+                row.get("first_trade_date") or "",
+            )
+        )
+        models.update_one(
+            {"$or": [{"_id": model_id}, {"model_id": model_id}]},
+            {"$set": {"prediction_sets": rows}},
+        )
+        for kind in ("research", "shadow"):
+            active = [
+                row
+                for row in rows
+                if row.get("kind") == kind and row.get("status") == "active"
+            ]
+            active.sort(key=lambda row: row.get("first_trade_date") or "")
+            for previous, current in zip(active, active[1:]):
+                if str(current.get("first_trade_date") or "") <= str(
+                    previous.get("last_trade_date") or ""
+                ):
+                    overlaps.append(
+                        f"{model_id}/{kind}: "
+                        f"{previous.get('prediction_set_id')} overlaps "
+                        f"{current.get('prediction_set_id')}"
+                    )
+    if overlaps:
+        log.warning("overlapping prediction sets: %s", "; ".join(overlaps))
+    missing_rows = int(
+        preds.count_documents({"prediction_set_id": {"$exists": False}}) or 0
+    )
+    if missing_rows:
+        log.warning("model_predictions rows missing prediction_set_id: %s", missing_rows)
+    empty_sets = sum(
+        1
+        for rows in summaries.values()
+        for row in rows
+        if int(row.get("prediction_count") or 0) == 0
+    )
+    return {
+        "sets": refreshed,
+        "models": len(summaries),
+        "overlaps": len(overlaps),
+        "missing_rows": missing_rows,
+        "empty_sets": empty_sets,
+    }
+
+
 def refresh_model_health(
     collections: Dict[str, Any],
     *,
@@ -89,6 +234,11 @@ def refresh_model_health(
     preds = collections.get(COLLECTION_PREDICTIONS)
     if models is None or preds is None:
         return {"checked": 0, "active_stale": 0}
+    prediction_set_summary: Dict[str, Any] = {}
+    try:
+        prediction_set_summary = refresh_prediction_set_registry(collections)
+    except Exception:
+        log.exception("prediction set registry refresh failed")
 
     if latest_market_date is None:
         latest_doc = preds.find_one({}, {"trade_date": 1}, sort=[("trade_date", -1)])
@@ -139,4 +289,5 @@ def refresh_model_health(
         "active_stale": active_stale,
         "latest_market_date": latest_market_date,
         "checked_at": now,
+        "prediction_sets": prediction_set_summary,
     }
