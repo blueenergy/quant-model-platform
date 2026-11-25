@@ -8,7 +8,12 @@ from quant_model_platform.dataset.features import (
     annotate_population,
     registry_document,
 )
-from quant_model_platform.dataset.manifest import build_manifest, content_hash, read_parquet_snapshot
+from quant_model_platform.dataset.manifest import (
+    build_manifest,
+    content_hash,
+    read_parquet_snapshot,
+    write_parquet_snapshot,
+)
 
 
 def test_snapshot_hash_reproducible(tmp_path: Path):
@@ -89,3 +94,12 @@ def test_manifest_carries_the_population_of_its_own_frame(tmp_path: Path):
     docs = {d["name"]: d for d in manifest.feature_registry}
     assert docs["growth_score"]["populated"] is True
     assert docs["value_score"]["populated"] is False
+
+
+def test_write_parquet_snapshot_replaces_atomically(tmp_path: Path):
+    path = tmp_path / "panel.parquet"
+    write_parquet_snapshot(pd.DataFrame({"a": [1]}), path)
+    write_parquet_snapshot(pd.DataFrame({"a": [2, 3]}), path)
+
+    assert pd.read_parquet(path)["a"].tolist() == [2, 3]
+    assert not list(tmp_path.glob(".*.tmp"))

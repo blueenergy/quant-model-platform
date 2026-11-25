@@ -77,6 +77,7 @@ def test_canonical_latest_register_mongo(monkeypatch, tmp_path):
     assert rc == 0
     assert seen["end_date"] == "20261014"
     assert seen["use_canonical_snapshot"] is True
+    assert seen["qc"] is True
     assert not datasets.inserts
     (flt, update, upsert), = datasets.updates
     assert flt == {"snapshot_id": "hs300-current"}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from quant_model_platform.timeutil import utcnow
 from pathlib import Path
@@ -64,12 +65,25 @@ def main(argv=None) -> int:
         default="raw",
         help="Feature registry: raw (no stock_scores rule scores) or legacy",
     )
+    parser.add_argument(
+        "--qc",
+        dest="qc",
+        action="store_true",
+        default=True,
+        help="Run the panel quality gate before writing the snapshot (default: on)",
+    )
+    parser.add_argument(
+        "--no-qc",
+        dest="qc",
+        action="store_false",
+        help="Skip the panel quality gate (research/backfill only)",
+    )
     args = parser.parse_args(argv)
 
     cfg = PlatformConfig.from_env()
     end_date = _resolve_end_date(args.end_date, index_code=args.index_code, cfg=cfg)
     parquet_dir = Path(cfg.parquet_root) / "snapshots"
-    _panel, manifest = build_production_panel(
+    panel, manifest = build_production_panel(
         index_code=args.index_code,
         start_date=args.start_date,
         end_date=end_date,
@@ -80,7 +94,9 @@ def main(argv=None) -> int:
         universe_source=args.universe_source,
         name_source=args.name_source,
         feature_set=args.feature_set,
+        qc=args.qc,
     )
+    qc_report = getattr(panel, "attrs", {}).get("qc") if panel is not None else None
     local_path = parquet_dir / (
         f"{args.index_code}_current.parquet"
         if args.canonical
@@ -99,6 +115,8 @@ def main(argv=None) -> int:
     print(f"parquet_path={uri}")
     print(f"rows={manifest.row_count}")
     print(f"end_date={manifest.end_date}")
+    if qc_report is not None:
+        print("qc=" + json.dumps(qc_report, ensure_ascii=False, sort_keys=True))
 
     if args.register_mongo:
         collections = get_ml_collections(config=cfg)
@@ -108,6 +126,7 @@ def main(argv=None) -> int:
                 "parquet_path": uri,
                 "parquet_uri": uri,
                 "updated_at": utcnow(),
+                **({"qc": qc_report} if qc_report is not None else {}),
             }
         )
         if args.canonical:

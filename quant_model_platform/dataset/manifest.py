@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import uuid
 from dataclasses import dataclass
 from quant_model_platform.timeutil import utcnow
@@ -104,8 +105,21 @@ def build_manifest(
 
 
 def write_parquet_snapshot(frame: pd.DataFrame, path: Path) -> Path:
+    """Write via a sibling temp file and atomically replace the target.
+
+    The canonical panel is rewritten while plan generation and research jobs
+    may be reading it. A direct ``to_parquet(path)`` exposes a partial file;
+    readers would parse a truncated snapshot. A rename in the same directory
+    is atomic, so a reader sees either the old file or the new one.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    frame.to_parquet(path, index=False)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        frame.to_parquet(tmp, index=False)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
     return path
 
 

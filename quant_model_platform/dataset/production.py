@@ -788,6 +788,7 @@ def build_production_panel(
     universe_source: str = "index_constituents",
     name_source: str = "name_change",
     feature_set: str = "raw",
+    qc: bool = False,
 ) -> Tuple[pd.DataFrame, Any]:
     """Build PIT score panel + forward labels; write parquet under parquet_dir.
 
@@ -801,6 +802,10 @@ def build_production_panel(
     ``"size_neutral"`` to residualize the label against ``log_market_cap``
     (the B6e-4 style check). Non-default modes are recorded in
     ``source_revision`` so a variant artifact cannot read as production.
+
+    ``qc=True`` runs the panel quality gate before the parquet is written, so
+    a duplicate key or a factor gap cannot replace the previous snapshot. The
+    report is attached to ``panel.attrs["qc"]`` for the caller to publish.
     """
     if universe_source not in _PANEL_UNIVERSE_SOURCES:
         raise ValueError(
@@ -927,6 +932,48 @@ def build_production_panel(
             path = parquet_dir / f"{index_code}_current.parquet"
         else:
             path = parquet_dir / f"{index_code}_production_{start_date}_{end_date}.parquet"
+        if qc:
+            from quant_model_platform.dataset.qc import (
+                check_panel_quality,
+                load_expected_trade_dates,
+                load_first_factor_dates,
+            )
+
+            first_factor_dates = load_first_factor_dates(
+                mongo, data_db_name=cfg.data_db_name, symbols=symbols
+            )
+            # The known 2015 boundary lives before a 2015-01-30 panel. Pull the
+            # calendar from the first factor date so the report can describe
+            # the exact 60-session window, while continuity still checks only
+            # from ``start_date``.
+            calendar_start = str(start_date)[:8]
+            if first_factor_dates:
+                calendar_start = min(calendar_start, min(first_factor_dates.values()))
+            report = check_panel_quality(
+                panel,
+                index_code=index_code,
+                start_date=str(start_date)[:8],
+                end_date=str(end_date)[:8],
+                first_factor_dates=first_factor_dates,
+                expected_dates=load_expected_trade_dates(
+                    mongo,
+                    data_db_name=cfg.data_db_name,
+                    start_date=calendar_start,
+                    end_date=str(end_date)[:8],
+                ),
+                feature_names=feature_names,
+                label_col=label_col,
+            )
+            panel.attrs["qc"] = report
+            if not report["ok"]:
+                raise RuntimeError("panel QC failed: " + "; ".join(report["errors"]))
+            log.info(
+                "panel QC ok rows=%d dates=%d symbols=%d warnings=%d",
+                report["row_count"],
+                report["date_count"],
+                report["symbol_count"],
+                len(report["warnings"]),
+            )
         write_parquet_snapshot(panel, path)
         # The suffix separates snapshots that share a window but not a feature
         # set. Without it, provenance for the raw-factor panel would read
